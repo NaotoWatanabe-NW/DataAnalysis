@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# 生成データ・成果物（再生成可能なため追跡しない）
+data/raw/
+data/interim/
+data/processed/
+reports/
+logs/

@@ -1,0 +1,19 @@
+[project]
+name = "dataanalysis"
+version = "0.1.0"
+description = "VINを主キーに設備トレーサビリティ/トレンド/不良/修正を統合し不良原因を追求する分析パイプライン"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "lightgbm>=4.7.0",
+    "matplotlib>=3.11.1",
+    "numpy>=2.5.1",
+    "pandas>=3.0.5",
+    "polars>=1.43.0",
+    "pyarrow>=25.0.0",
+    "pyyaml>=6.0.3",
+    "scikit-learn>=1.9.0",
+    "seaborn>=0.13.2",
+    "shap",
+    "statsmodels>=0.14.6",
+]
