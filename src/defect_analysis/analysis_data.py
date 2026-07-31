@@ -35,12 +35,68 @@ class FeatureSpec:
 
 
 def load_features(cfg: Config) -> pd.DataFrame:
-    """processed/features を読み込み、analysis.filters を適用して返す。"""
+    """processed/features を読み込み、analysis.filters を適用して返す。
+
+    旧経路（generate/ingest/integrate/features）専用。stats/ml はこちらを使い続ける。
+    """
     processed_dir = cfg.path("paths.processed_dir")
     fmt = resolve_format(cfg.get("storage.format", "parquet"))
     df = load_df(table_path(processed_dir, "features", fmt), parse_dates=_DATE_COLS)
     df = apply_filters(df, cfg)
     return df
+
+
+def load_real_panel(cfg: Config) -> pd.DataFrame:
+    """実データ経路の `data/interim/vin_panel.parquet` を読み込み、analysis.filters を適用して返す。
+
+    parquet はスキーマに datetime を保持しているため CSV 用の parse_dates は不要。
+    """
+    panel_path = cfg.path("real_ingest.panel_path", default="data/interim/vin_panel.parquet")
+    df = pd.read_parquet(panel_path)
+    df = apply_filters(df, cfg)
+    return df
+
+
+def derive_production_date(df: pd.DataFrame) -> pd.Series:
+    """VIN の生産日の代理値を返す（行内の全 datetime 列の最小値）。
+
+    実データパネルは列名がソースごとに異なる（`process_month` のような固定列を持たない）ため、
+    特定列名を仮定せず、行に存在する全 datetime 列のうち最も早い時刻を使う。
+    通常は最上流工程（前処理・シーラー炉等）の入口通過時刻が採用される。
+    """
+    dt_cols = [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c])]
+    if not dt_cols:
+        return pd.Series(pd.NaT, index=df.index)
+    return df[dt_cols].min(axis=1)
+
+
+def drop_all_missing(df: pd.DataFrame, spec: FeatureSpec) -> FeatureSpec:
+    """全行が欠損の説明変数を除外する。
+
+    実データパネルは trend（traceability と期間が重複しない）や、この期間に未使用の
+    工程列（例: ブース#3）が丸ごと NaN になりうる。scikit-learn の Imputer は全欠損列だと
+    中央値が NaN になり無意味な列を残すため、学習前に落とす。
+    """
+    numeric = [c for c in spec.numeric if df[c].notna().any()]
+    categorical = [c for c in spec.categorical if df[c].notna().any()]
+    dropped = (len(spec.numeric) - len(numeric)) + (len(spec.categorical) - len(categorical))
+    if dropped:
+        logger.info("全欠損の説明変数を %d 列除外しました。", dropped)
+    return FeatureSpec(numeric=numeric, categorical=categorical)
+
+
+def traceability_measure_columns(columns: Iterable[str]) -> list[str]:
+    """実データパネルの列から、加工設備（traceability）由来の測定値列のみを返す。
+
+    `defect_*` / `repair_*` / `trend__*` / `present__*` / 台帳列（vin 系・has_repair_record）は
+    「加工設備」ではない別系統のため除外する（`equipment_measure_groups` に渡す前の前処理用）。
+    """
+    ledger_cols = {"vin", "vin_base", "vin_pass_no", "vin_format", "has_repair_record"}
+    excluded_prefixes = ("defect_", "repair_", "trend__", "present__")
+    return [
+        c for c in columns
+        if c not in ledger_cols and not c.startswith(excluded_prefixes) and "__" in c
+    ]
 
 
 def _describe_clause(df: pd.DataFrame, clause: dict) -> str:

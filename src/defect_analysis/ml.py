@@ -1,8 +1,10 @@
-"""ステップ6: 機械学習で予測性能を判定する（主軸: LightGBM）。
+"""ステップ6: 機械学習で予測性能を判定する（主軸: LightGBM。実データパネルが対象）。
 
-工程系の説明変数のみ（リーク列除外）から、不良有無・重大不良有無（分類）と
-不良点数（回帰）を予測する。ベースライン→木モデル→LightGBM の順で交差検証比較し、
-LightGBM で保持テストの評価図と特徴量重要度（gain / permutation）を出力する。
+工程系の説明変数のみ（リーク列除外）から、analysis.targets（既定は
+classification=[has_repair_record], regression=[defect_*__count 等]）を予測する。
+ベースライン→木モデル→LightGBM の順で交差検証比較し、LightGBM で保持テストの評価図と
+特徴量重要度（gain / permutation）を出力する。p ≫ n（説明変数が数百〜千に対し行数は
+千数百）であるため、過学習・不安定な重要度に注意（README 参照）。
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ import pandas as pd
 from lightgbm import LGBMClassifier, LGBMRegressor
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.impute import SimpleImputer
 from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.metrics import auc, precision_recall_curve, roc_curve
@@ -23,7 +26,15 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from . import viz_style as vs
-from .analysis_data import AnnotationMeta, FeatureSpec, build_annotation_meta, get_targets, load_features, resolve_predictors
+from .analysis_data import (
+    AnnotationMeta,
+    FeatureSpec,
+    build_annotation_meta,
+    drop_all_missing,
+    get_targets,
+    load_real_panel,
+    resolve_predictors,
+)
 from .config import Config
 
 logger = logging.getLogger(__name__)
@@ -39,10 +50,25 @@ _METRIC_LABEL = {
 
 
 def _build_preprocessor(spec: FeatureSpec) -> ColumnTransformer:
+    """欠損を補完してからスケーリング/エンコードする。
+
+    実データは構造的に欠損が多い（ある VIN がその設備を通過していなければ、
+    その設備の測定値列は全て NaN）。scikit-learn の StandardScaler/OneHotEncoder は
+    NaN を扱えないため、Imputer を先に挟む（LightGBM は NaN をネイティブに扱えるが、
+    パイプラインは baseline/RandomForest とも共有するため全モデル向けに補完する）。
+    """
+    numeric_pipe = Pipeline([
+        ("impute", SimpleImputer(strategy="median")),
+        ("scale", StandardScaler()),
+    ])
+    categorical_pipe = Pipeline([
+        ("impute", SimpleImputer(strategy="constant", fill_value="missing")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+    ])
     return ColumnTransformer(
         transformers=[
-            ("num", StandardScaler(), spec.numeric),
-            ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), spec.categorical),
+            ("num", numeric_pipe, spec.numeric),
+            ("cat", categorical_pipe, spec.categorical),
         ],
         remainder="drop",
     )
@@ -205,10 +231,10 @@ def _run_one_target(target: str, task: str, df: pd.DataFrame, spec: FeatureSpec,
 
 
 def run_ml(cfg: Config) -> dict:
-    """全目的変数について交差検証比較・保持テスト評価・重要度を出力する。"""
+    """実データパネルに対し、全目的変数について交差検証比較・保持テスト評価・重要度を出力する。"""
     vs.apply_style()
-    df = load_features(cfg)
-    spec = resolve_predictors(df, cfg)
+    df = load_real_panel(cfg)
+    spec = drop_all_missing(df, resolve_predictors(df, cfg))
     targets = get_targets(cfg)
     a = cfg.get("analysis", {}) or {}
     seed = int(a.get("random_state", 42))
@@ -216,7 +242,6 @@ def run_ml(cfg: Config) -> dict:
     test_size = float(a.get("test_size", 0.25))
     out_dir = cfg.path("paths.reports_dir", create=True) / "ml"
     out_dir.mkdir(parents=True, exist_ok=True)
-    meta = build_annotation_meta(df, cfg)
 
     logger.info("説明変数: 数値%d + カテゴリ%d = %d 列（リーク列除外済）",
                 len(spec.numeric), len(spec.categorical), len(spec.all))
@@ -227,8 +252,21 @@ def run_ml(cfg: Config) -> dict:
     for task, target in tasks:
         if target not in df.columns:
             continue
+        # 目的変数が NaN の行（例: defect_*__count は「未検査」で NaN）は学習対象から除外する。
+        # 0 埋めしていない設計（docs/real_data_ingest_design.md §13-7）なので、ここで落とさないと
+        # scikit-learn が「y に NaN がある」で例外を投げる。
+        target_df = df[df[target].notna()]
+        n_dropped = len(df) - len(target_df)
+        if n_dropped:
+            logger.info("[%s] 目的変数が欠損（未検査等）の %d 行を学習対象から除外しました。", target, n_dropped)
+        if task == "classification" and target_df[target].nunique() < 2:
+            logger.warning("[%s] 目的変数が単一クラスのため学習をスキップします。", target)
+            continue
+        target_meta = build_annotation_meta(target_df, cfg)
         logger.info("=== モデル学習: %s (%s) ===", target, task)
-        all_perf.append(_run_one_target(target, task, df, spec, cfg, out_dir, seed, folds, test_size, meta))
+        all_perf.append(
+            _run_one_target(target, task, target_df, spec, cfg, out_dir, seed, folds, test_size, target_meta)
+        )
 
     perf = pd.concat(all_perf, ignore_index=True)
     perf_path = out_dir / "model_performance.csv"

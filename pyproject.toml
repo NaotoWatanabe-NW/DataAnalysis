@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "lightgbm>=4.7.0",
     "matplotlib>=3.11.1",
-    "numpy>=2.5.1",
+    "numpy>=2.4,<2.5",
     "pandas>=3.0.5",
     "polars>=1.43.0",
     "pyarrow>=25.0.0",
@@ -17,3 +17,14 @@ dependencies = [
     "shap",
     "statsmodels>=0.14.6",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+# numba は numpy<2.5 を要求するため、numpy を 2.4 系に固定しないと
+# 解決器が numba 0.53.1 (Python<3.10 専用) まで後退してビルドに失敗する。
+# 併せて numba の下限を制約し、全プラットフォームで 0.53.1 を排除する。
+[tool.uv]
+constraint-dependencies = ["numba>=0.62"]

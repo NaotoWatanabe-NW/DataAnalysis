@@ -1,7 +1,8 @@
-"""ステップ5: 統計手法で相関・群間差を判定する。
+"""ステップ5: 統計手法で相関・群間差を判定する（実データパネルが対象）。
 
-目的変数（不良有無/重大不良有無=2群、不良点数=連続）に対して、工程系の
-説明変数それぞれの関連を単変量検定で評価する。多重比較は BH-FDR で補正。
+目的変数（analysis.targets。既定は classification=[has_repair_record],
+regression=[defect_*__count 等]）に対して、工程系の説明変数それぞれの関連を
+単変量検定で評価する。多重比較は BH-FDR で補正。
 
   数値 × 2群       : Welch t 検定 / Mann-Whitney U（効果量 Cohen's d / 順位二列相関）
   カテゴリ × 2群    : カイ二乗検定（効果量 Cramér's V）
@@ -19,7 +20,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-from .analysis_data import get_targets, load_features, resolve_predictors
+from .analysis_data import drop_all_missing, get_targets, load_real_panel, resolve_predictors
 from .config import Config
 from .io_utils import resolve_format  # noqa: F401  (レポートは CSV 固定だが整合のため)
 
@@ -135,9 +136,9 @@ def _row(target, feature, ftype, test, stat, p, effect, effect_name, n) -> dict:
 
 
 def run_stats(cfg: Config) -> dict:
-    """全目的変数×説明変数の単変量検定を実施し、CSV とサマリを出力する。"""
-    df = load_features(cfg)
-    spec = resolve_predictors(df, cfg)
+    """実データパネルに対し、全目的変数×説明変数の単変量検定を実施し、CSV とサマリを出力する。"""
+    df = load_real_panel(cfg)
+    spec = drop_all_missing(df, resolve_predictors(df, cfg))
     targets = get_targets(cfg)
     reports_dir = cfg.path("paths.reports_dir", create=True) / "stats"
     reports_dir.mkdir(parents=True, exist_ok=True)

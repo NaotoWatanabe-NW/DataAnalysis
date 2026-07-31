@@ -66,15 +66,20 @@ features:
 #   を検証する。不良/修正の結果由来列はリークとして説明変数から必ず除外する。
 # ---------------------------------------------------------------------
 analysis:
+  # stats（run_stats）/ ml（run_ml）が対象にする目的変数（vin_panel.parquet の列名）。
+  #   has_defect は使えない（defect_*__has は「未検査」が NaN になり 0/1 が完全に揃わないため。
+  #   docs/real_data_ingest_design.md §13-7）。has_repair_record は 0/1 が全 VIN で必ず定義される。
+  #   regression は「未検査」VIN が自然に dropna される（_test_numeric_vs_continuous 等）ため
+  #   defect_*__count をそのまま使える。
   targets:
-    classification: [has_defect, has_severe_defect]  # 不良有無 / 重大不良有無
-    regression: [defect_count]                        # 不良点数
+    classification: [has_repair_record]                                          # リペア記録有無
+    regression: [defect_上塗ブツ検__count, defect_電着ブツ検__count, repair_修正__count]  # 不良点数・修正件数
 
-  # 行フィルタ: load_features 読込直後に「リスト順」で AND 適用する（EDA/ML/stats 全系に効く）。
+  # 行フィルタ: load_real_panel 読込直後に「リスト順」で AND 適用する（EDA/ML/stats 全系に効く）。
   #   省略 or 空リストなら全件（現行挙動と完全一致）。
   #   1要素 = 「column + 演算子」か「query 単独」。演算子: eq / in / not_in / min / max。
-  #   min と max は同一句で併用可（数値レンジ）。EQ-xx__measure のようにハイフンを含む列名は
-  #   query の識別子として扱えないため、EQ 列はレンジ/集合系の句（min/max/in）で指定する。
+  #   min と max は同一句で併用可（数値レンジ）。{設備}__{measure} のようにハイフンを含む列名は
+  #   query の識別子として扱えないため、そのような列はレンジ/集合系の句（min/max/in）で指定する。
   #   設定例:
   #     filters:
   #       - {column: process_month, in: ["2026-01", "2026-02"]}   # 年月の複数指定
@@ -90,11 +95,6 @@ analysis:
   #   plant_code・line_code のように「実データ次第で無い列」を warn で安全に無視する用途。
   filters_on_missing_column: warn   # warn | error（既定 warn）
 
-  # （任意）設備別ドライバ測定値のハイライト対象。空なら synthesize.defect_drivers を参照し、
-  #   それも無ければハイライトなし。図の生成対象は features のトレンド列から動的に導出するので、
-  #   この設定が無くても図は出る（ハイライト＝箱ひげ小見出しに信号測定値の印を付けるだけ）。
-  eda_driver_highlight: []
-
   # 説明変数から除外する結果由来列（不良・修正の帰結）。
   #   leakage_prefixes / leakage_regex の規約で拾える列は極力ここに書かない
   #   （新しい結果列が増えても規約側で自動的に拾える状態を保つため）。
@@ -106,12 +106,25 @@ analysis:
   # 名前が prefix に乗らない結果列（例: first_defect_date / last_defect_date）向けの正規表現（任意）
   leakage_regex: ["_defect_", "defect_date$"]
   # 識別子・生時刻（説明変数にしない）
-  id_columns: [vin, lot_no, first_in_ts, last_out_ts]
+  id_columns: [vin, vin_base, lot_no, first_in_ts, last_out_ts]
   cv_folds: 5
   test_size: 0.25
   random_state: 42
-  # EDA で層別に使う主な目的変数
-  eda_target: has_defect
+  # EDA（eda.py。実データ経路の vin_panel.parquet を読む）で層別に使う目的変数。
+  #   has_defect は使えない（defect_*__has は「未検査」が NaN になり 0/1 が完全に揃わないため。
+  #   docs/real_data_ingest_design.md §13-7）。has_repair_record は 0/1 が全 VIN で必ず定義される。
+  eda_target: has_repair_record
+  # ヒストグラム列。空なら「ほぼ一定でない」列に絞ったうえで欠損の少ない順に eda_histogram_max 本を自動選定
+  eda_histogram_columns: []
+  eda_histogram_max: 6
+  eda_histogram_min_nunique: 10   # ヒストグラム対象とする最小ユニーク値数（これ未満は準定数として除外）
+  # 設備あたりの測定値列数の上限（超過時は nunique 上位に絞る。実測: 242列の設備でヒートマップが40秒超）
+  eda_max_measures_boxplot: 20
+  eda_max_measures_heatmap: 15
+  eda_max_categories: 15   # カテゴリ別リペア率チャートで扱う最大カテゴリ数（超過列は除外）
+  eda_histogram_max_per_equipment: 6   # 設備別ヒストグラムの列数上限（分布の広い列を優先）
+  eda_cross_equipment_top_k: 3         # 設備間ヒートマップに採用する設備あたりの代表列数
+  eda_cross_equipment_max_columns: 60  # 設備間ヒートマップの総列数上限（超過時は先頭のみ使用）
 
 # ---------------------------------------------------------------------
 # 実データ取り込み（docs/real_data_ingest_design.md）
