@@ -13,7 +13,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
+from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -23,6 +26,11 @@ from .config import Config
 logger = logging.getLogger(__name__)
 
 TREND_MEASURES = ["torque", "temperature", "pressure", "vibration"]
+
+# generate() が書き込むサブディレクトリ（High-2: raw_dir 共有時の実データ混入ガード対象）
+_WRITE_KINDS = ("traceability", "trend", "defect", "repair")
+# このマーカーが raw_dir 直下にあれば「過去に generate が書き込んだ場所」とみなす。
+_GENERATE_MARKER_FILENAME = ".generate_marker.json"
 
 # 不良カテゴリ -> 不良コード / 修正アクション
 _CATEGORY_CODE = {
@@ -41,6 +49,48 @@ _REPAIR_ACTION = {
 }
 
 
+def _guard_raw_dir_before_write(raw_dir: Path, *, force: bool) -> None:
+    """書き込み前ガード（High-2）。
+
+    `paths.raw_dir`（generate の書き込み先）と `real_ingest.raw_dir`（convert の読込元）が
+    同一ディレクトリに設定されていると、generate の合成 CSV が実データに混入し、
+    discover_sources が別ソースとして誤認識してしまう。
+    raw_dir に generate 由来のマーカーが無いのに kind サブディレクトリへ既に CSV が
+    置かれている場合は、実データが置かれている可能性があるとみなして中断する。
+    """
+    if force:
+        return
+    marker = raw_dir / _GENERATE_MARKER_FILENAME
+    if marker.exists():
+        return
+    for kind in _WRITE_KINDS:
+        kind_dir = raw_dir / kind
+        if kind_dir.exists() and any(kind_dir.glob("*.csv")):
+            raise ValueError(
+                f"{raw_dir} には generate（合成データ）由来でない CSV が既に存在する可能性があります"
+                f"（{kind_dir}）。実データが置かれている可能性があるため書き込みを中断しました。"
+                " config の paths.raw_dir を別ディレクトリに変更するか、対象ディレクトリを空にしてください。"
+                " 強制的に上書きする場合は generate(cfg, force=True) "
+                "（CLI: `python main.py generate --force`）を使ってください。"
+            )
+
+
+def _write_generate_marker(raw_dir: Path) -> None:
+    """generate() が正常に書き込んだ後、raw_dir がこのモジュール由来であることを記録する。"""
+    marker = raw_dir / _GENERATE_MARKER_FILENAME
+    marker.write_text(
+        json.dumps(
+            {
+                "generated_by": "defect_analysis.generate",
+                "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
 def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-x))
 
@@ -52,8 +102,12 @@ def _zscore(x: np.ndarray) -> np.ndarray:
     return (x - x.mean()) / std
 
 
-def generate(cfg: Config) -> dict[str, int]:
-    """設定に基づき 4 データの分割 CSV を data/raw 配下へ書き出す。"""
+def generate(cfg: Config, *, force: bool = False) -> dict[str, int]:
+    """設定に基づき 4 データの分割 CSV を data/raw 配下へ書き出す。
+
+    force=True でなければ、書き込み前に `_guard_raw_dir_before_write` で
+    実データ混入の可能性をチェックする（High-2）。
+    """
     s = cfg.get("synthesize")
     seed = int(cfg.get("project.random_seed", 42))
     rng = np.random.default_rng(seed)
@@ -71,6 +125,7 @@ def generate(cfg: Config) -> dict[str, int]:
     repair_rate = float(s["repair_rate_given_defect"])
 
     raw_dir = cfg.path("paths.raw_dir", create=True)
+    _guard_raw_dir_before_write(raw_dir, force=force)
 
     # ---- VIN 台帳（1:1 の基準）----------------------------------------
     vins = np.array([f"VIN{i:07d}" for i in range(n)])
@@ -228,6 +283,7 @@ def generate(cfg: Config) -> dict[str, int]:
 
     # ---- 書き出し（生データは常に CSV、分割単位で保存）------------------
     counts = _write_all(cfg, raw_dir, trace_frames, trend_frames, defect_df, repair_df)
+    _write_generate_marker(raw_dir)
 
     realized_defect_rate = defect_df["vin"].nunique() / n if not defect_df.empty else 0.0
     logger.info(

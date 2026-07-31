@@ -41,9 +41,14 @@ class Config:
             node = node[part]
         return node
 
-    def path(self, dotted_key: str, *, create: bool = False) -> Path:
-        """paths.* をルート基準の絶対パスに解決する。create=True なら mkdir する。"""
-        rel = self.get(dotted_key)
+    def path(self, dotted_key: str, *, default: str | None = None, create: bool = False) -> Path:
+        """dotted_key をルート基準の絶対パスに解決する。
+
+        default を指定すると、キーが未設定でもエラーにせずその値を使う
+        （real_ingest.* のような「config になければ既定値」なキー向け）。
+        create=True なら mkdir する。
+        """
+        rel = self.get(dotted_key, default)
         if rel is None:
             raise KeyError(f"パス設定が存在しません: {dotted_key}")
         p = (self.root / rel).resolve()

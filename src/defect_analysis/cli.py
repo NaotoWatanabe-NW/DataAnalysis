@@ -1,11 +1,15 @@
 """コマンドラインインターフェース（サブコマンド方式）。
 
-パイプライン工程:
+パイプライン工程（合成データ経路）:
     python main.py all                 # generate -> ingest -> integrate -> features
     python main.py generate            # 合成データ生成
     python main.py ingest              # 分割CSV収集・統合（ステップ1）
     python main.py integrate           # VIN軸で結合（ステップ2）
     python main.py features            # 特徴量作成（ステップ3）
+
+実データ経路（docs/real_data_ingest_design.md）:
+    python main.py convert [--force]                       # raw CSV -> data/lake/ Parquet
+    python main.py assemble [--date-from] [--date-to]       # data/lake/ -> data/interim/vin_panel.parquet
 
 ユーティリティ:
     python main.py catalog             # CSVの各列名・型・元ファイル名等を YAML に記録
@@ -54,7 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("all", parents=[common], help="全工程を順に実行")
     for stage in ALL_ORDER:
-        sub.add_parser(stage, parents=[common], help=f"{stage} 工程のみ実行")
+        p_stage = sub.add_parser(stage, parents=[common], help=f"{stage} 工程のみ実行")
+        if stage == "generate":
+            p_stage.add_argument(
+                "--force", action="store_true",
+                help="paths.raw_dir に既存ファイルがあっても上書きを許可する（実データ混入ガードを無視）",
+            )
 
     p_catalog = sub.add_parser("catalog", parents=[common], help="CSVのスキーマを YAML カタログに記録")
     p_catalog.add_argument("--input", default=None, help="対象glob/ディレクトリ/ファイル（既定: catalog.input_glob）")
@@ -64,6 +73,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_category.add_argument("--input", required=True, help="入力CSV（大/中/小カテゴリ列を含む）")
     p_category.add_argument("--output", required=True, help="統合カテゴリ列を付与した出力CSV")
     p_category.add_argument("--map", default=None, help="変換設定yaml（既定: config/category_map.yaml）")
+
+    # 実データ経路（docs/real_data_ingest_design.md）: raw CSV -> lake -> vin_panel
+    p_convert = sub.add_parser("convert", parents=[common], help="実データ: raw CSV を data/lake/ の Parquet に変換")
+    p_convert.add_argument("--force", action="store_true", help="増分判定を無視して全ファイルを再変換")
+
+    p_assemble = sub.add_parser("assemble", parents=[common], help="実データ: data/lake/ から VIN パネルを組み立てる")
+    p_assemble.add_argument("--date-from", default=None, help="対象期間の開始日（YYYY-MM-DD）。未指定なら config の設定 or 全期間")
+    p_assemble.add_argument("--date-to", default=None, help="対象期間の終了日（YYYY-MM-DD）。未指定なら config の設定 or 全期間")
 
     # 分析ステージ（features 生成後に実行）
     sub.add_parser("eda", parents=[common], help="ステップ4: EDAグラフ生成")
@@ -88,7 +105,9 @@ def main(argv: list[str] | None = None) -> int:
     cfg = Config.load(args.config)
     setup_logging(cfg.path("paths.logs_dir", create=True), getattr(logging, args.log_level.upper(), logging.INFO))
 
-    if args.command in STAGES or args.command == "all":
+    if args.command == "generate":
+        generate(cfg, force=args.force)
+    elif args.command in STAGES or args.command == "all":
         run_pipeline(args.command, cfg)
     elif args.command == "catalog":
         from .schema_catalog import build_catalog
@@ -110,6 +129,14 @@ def main(argv: list[str] | None = None) -> int:
         from .ml import run_ml
 
         run_ml(cfg)
+    elif args.command == "convert":
+        from .raw_convert import convert_all
+
+        convert_all(cfg, force=args.force)
+    elif args.command == "assemble":
+        from .assemble import assemble
+
+        assemble(cfg, date_from=args.date_from, date_to=args.date_to)
 
     logger.info("完了: %s", args.command)
     return 0

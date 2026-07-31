@@ -61,6 +61,7 @@ def _df() -> pd.DataFrame:
             "defect_count": [0, 2],
             "defect_foo": [0, 1],  # 新規結果列（明示リストに無いが接頭辞 "defect" で除外されるはず）
             "first_defect_date_note": ["x", "y"],  # 接頭辞では拾えないが leakage_regex "_defect_" にマッチ
+            "repair_修正__count": [0, 1],  # repair 由来の結果列（接頭辞 "repair" で除外されるはず）
         }
     )
 
@@ -79,6 +80,13 @@ class ResolvePredictorsLeakageTest(unittest.TestCase):
         self.assertNotIn("defect_foo", cfg.get("analysis.leakage_columns"))  # 明示リストには無い
         spec = resolve_predictors(_df(), cfg)
         self.assertNotIn("defect_foo", spec.all)
+
+    def test_repair_prefixed_column_is_auto_excluded_without_explicit_listing(self):
+        # docs/real_data_repair_design.md §6.4: repair_* はリーク列なので説明変数に1列も残らない。
+        cfg = _cfg()
+        self.assertNotIn("repair_修正__count", cfg.get("analysis.leakage_columns"))  # 明示リストには無い
+        spec = resolve_predictors(_df(), cfg)
+        self.assertNotIn("repair_修正__count", spec.all)
 
     def test_regex_only_leakage_column_is_excluded_via_leakage_regex(self):
         # "first_defect_date_note" は prefix "defect"/"has_defect" 等のいずれにも startswith しないが、

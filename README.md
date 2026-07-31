@@ -7,6 +7,12 @@
 **ステップ1〜3（データ集計・統合・特徴量作成）** まで。以降のグラフ・統計・機械学習は
 生成済みの特徴量マート（`data/processed/features`）を入力に追加していく。
 
+> **2経路が並存している。** 以下の「合成データ経路」（`generate`→`ingest`→`integrate`→`features`、
+> 89本のテストで担保）は動作確認用の**廃止候補**。実データを使う場合は本書後半の
+> 「実データ経路（`convert` / `assemble`）」を使うこと（詳細設計は
+> [docs/real_data_ingest_design.md](docs/real_data_ingest_design.md)）。実データパネルが
+> 下流（eda/stats/ml）に接続できた時点で、合成データ経路は次フェーズで削除する。
+
 ## データモデル（VIN 基数）
 
 | データ | 粒度 | VIN との基数 | 生成先 |
@@ -14,7 +20,7 @@
 | トレーサビリティ | 設備ごと・月ごと CSV | 1:1（設備単位） | `data/raw/traceability/` |
 | トレンド | 設備ごと・月ごと CSV | 1:1（設備単位） | `data/raw/trend/` |
 | 不良 | 月ごと CSV | 1:N（無い VIN は行なし） | `data/raw/defect/` |
-| 修正 | 月ごと CSV | 0..1（修正なしは行なし） | `data/raw/repair/` |
+| 修正 | 月ごと CSV | 0..N（修正なしは行なし。実データでは最大5行/VIN） | `data/raw/repair/` |
 
 ## パイプライン工程
 
@@ -48,12 +54,17 @@ src/defect_analysis/
   viz_style.py              可視化スタイル（検証済みパレット+日本語フォント）
   schema_catalog.py         ユーティリティ: CSVスキーマを YAML カタログ化
   category_integrate.py     ユーティリティ: 大/中/小→統合カテゴリ生成
+  naming.py                 実データ経路: 列名・ソース名の機械的正規化
+  vin_key.py                実データ経路: VIN 正規化（空白除去・base/pass_no 分解・ダミー判定）
+  raw_sources.py             実データ経路: data/raw/ の走査・ソース定義
+  raw_convert.py             実データ経路: raw CSV → data/lake/ Parquet 変換・読取
+  assemble.py                実データ経路: data/lake/ → VIN パネル組立（trend時刻結合含む）
   cli.py                    argparse CLI（サブコマンド方式）
 config/category_map.yaml    統合カテゴリの変換ルール
 data/sample/                サンプル入力（大/中/小カテゴリ）
 tests/test_transforms.py    コア変換ロジックのテスト（unittest）
 main.py                     エントリポイント
-data/                       raw / interim / processed（git 管理外）
+data/                       raw / lake / interim / processed（git 管理外）
 reports/                    データ辞書・カタログ・数値サマリ（git 管理外）
 ```
 
@@ -81,6 +92,14 @@ uv run python main.py integrate     # ステップ2のみ
 uv run python main.py features      # ステップ3のみ
 uv run python main.py all --config config/config.yaml --log-level DEBUG
 ```
+
+> **`data/raw` は実データ用。** `paths.raw_dir`（`generate` の書き込み先）と
+> `real_ingest.raw_dir`（`convert` の読込元）は既定で同じ `data/raw` を指す。実データを
+> `data/raw` に置いて運用する場合、`generate`（合成データ生成）を使うと実データへの混入を
+> 避けるため中断される（`data/raw/{traceability,trend,defect,repair}/` に generate 由来でない
+> CSV が既にある場合の書き込み前ガード）。合成データ経路を使う場合は `paths.raw_dir` を
+> 実データとは別のディレクトリに変更するか、強制的に上書きするなら
+> `python main.py generate --force` を使うこと。
 
 ### ユーティリティ
 
@@ -200,6 +219,79 @@ analysis:
 
 合成データには「設備トレンドのドライバ測定値 → 対応する不良」という因果を注入しており
 （例: 溶接 EQ-04 の振動増大 → 機能不良）、後段の統計検定・機械学習で実際に検出可能な信号になる。
+
+## 実データ経路（`convert` / `assemble`）
+
+`data/raw/{traceability,trend,defect,repair}/*.csv` の**実データ**を VIN 単位の分析用パネル
+`data/interim/vin_panel.parquet` にするための経路。上記の合成データ経路（`generate`〜`features`）
+とは完全に独立しており、出力先も別（`data/lake/` / `data/interim/vin_panel.parquet`）。
+詳細設計は [docs/real_data_ingest_design.md](docs/real_data_ingest_design.md)、
+実データの実測事実は [docs/real_data_facts.md](docs/real_data_facts.md)。
+
+`repair`（修正実績、`data/raw/repair/defect.csv`）は cp932 エンコーディングかつ独自のクセ（VIN
+先頭の `'`、`00000000 000000` という欠測番兵、`修正日`ではなく`PB_ON`が生産日のアンカー等）を
+持つため専用の追補設計 [docs/real_data_repair_design.md](docs/real_data_repair_design.md) に従う。
+repair は VIN 台帳（他ソースとの和集合）には加えず、既存台帳への left join のみで
+`repair_*` 列（すべて `analysis.leakage_prefixes` でリーク除外される）を付与する。
+
+> **個人情報の取り扱い（既定でハッシュ化）**: repair の `修正員`（作業者氏名）列は `convert` 段階で
+> 不可逆ハッシュ化し（既定 `real_ingest.convert.by_kind.repair.pii.mode: hash`）、`data/lake/` を含め
+> 生の氏名をどこにも保存しない。ハッシュ列は `修正員_id` という名前になる。氏名のまま保持したい場合は
+> `mode: keep`、列ごと削除したい場合は `mode: drop` に変更できるが、既定は `hash` を推奨する
+> （ソルトは `pii.salt` または環境変数 `DEFECT_ANALYSIS_PII_SALT` で指定可能。ソルトを変えると
+> 過去のレイクとハッシュ ID が一致しなくなるため `--force` 再変換が必要）。
+
+```text
+convert   → raw CSV を列名正規化・VIN 正規化・日付パーティション付き Parquet に変換（増分・冪等）
+              data/raw/{kind}/*.csv → data/lake/{kind}/{source}/date=YYYY-MM-DD/*.parquet
+assemble  → レイクをソース別に集約・VIN 横結合・trend 時刻結合してパネル化
+              data/lake/ → data/interim/vin_panel.parquet
+```
+
+```bash
+.venv/bin/python main.py convert                                  # 増分変換（変更ファイルのみ）
+.venv/bin/python main.py convert --force                          # 全ファイル強制再変換
+.venv/bin/python main.py assemble                                 # 全期間でパネル組立
+.venv/bin/python main.py assemble --date-from 2026-07-24 --date-to 2026-07-25  # 期間を絞る
+```
+
+1年分では変換後のレイクでも列数が最大 621（trend/ブース）に達し、パネルは **1日分でも
+約1,300〜1,500行 × 約1,870列と p ≫ n になる**（特徴量選択が下流で別途必須）。1年分（約32万
+VIN）を扱う場合は `--date-from`/`--date-to` と `real_ingest.trend.include_columns` による絞り込みが前提。
+
+### 主な出力
+
+| 出力 | 内容 |
+|---|---|
+| `data/lake/{kind}/{source}/date=.../*.parquet` | 変換済みレイク（`convert`） |
+| `data/lake/_manifest.json` | 増分変換の管理台帳（size/mtime） |
+| `data/interim/vin_panel.parquet` | VIN × 全列のパネル（`assemble`） |
+| `reports/column_name_mapping.csv` | 列名正規化の対応表（正規化後 → 元列名。`convert` 出力） |
+| `reports/ingest_quality.csv` | ソース別: 採用ファイル数・行数・VIN数・ダミー除外数・重複数など |
+| `reports/vin_panel_dictionary.csv` | パネルの列名・dtype・欠損数・ユニーク数・例・由来ソース |
+| `reports/trend_anchor_map.csv` | trend 列トークン → アンカーとなる traceability ソース・列・解決経路 |
+| `reports/trend_join_report.csv` | アンカー別の trend マッチ率と期間 |
+
+### config（`real_ingest:` セクション）の主なキー
+
+- `real_ingest.vin.suffix_policy`: VIN サフィックス（`a`/`b`/`c`）の扱い。`keep`（既定・別キー） | `merge`（`vin_base` に丸める）
+- `real_ingest.sources` / `defaults`: 複数行/VIN ソース（自動判定・宣言不要）の集約方法（`aggs`）・pivot 列（`pivot_by`）。`sources` は defaults と異なる挙動にしたいソースのみ上書き記入する
+- `real_ingest.defect`: 不良サイズ/種類/検査部位の列名、種類別カウント列を作るか（`by_kind`）
+- `real_ingest.repair`: repair（修正実績）の VIN 集約設定。`time_column`（`修正日時`）/
+  `production_time_column`（`PB_ON`。date パーティションのアンカーと同じ）/ `workload_column`（`修正工数`）/
+  `category_columns`（列ごとにカウント展開するか。既定は `大分類` のみ）/ `worker_column`（`修正員_id`）/
+  `max_category_columns`（超過で `ValueError`）。詳細は [docs/real_data_repair_design.md](docs/real_data_repair_design.md)
+- `real_ingest.source_aliases`: `"{kind}/{source_key}" -> 別名` でソース名の衝突を解決する
+  （既定 `repair/defect: 修正`。ファイル名 `defect.csv` が `defect` kind の `defect` ソースと衝突するため）
+- `real_ingest.convert.encoding_fallbacks` / `by_kind`: kind 単位でエンコーディング・時刻アンカー列・
+  repair 専用の前処理（アポストロフィ除去・欠測番兵の NA 化・日時列の組み立て・PII ハッシュ化）を上書きする
+- `real_ingest.trend`: trend 採用列（`include_suffixes`/`include_columns`）、窓集約（`mode`/`window_minutes`/`tolerance_minutes`）、
+  アンカー解決（`anchor_map`/`fallback_anchor_source`）、trend×VIN 非重複時の挙動（`on_no_overlap`: `warn_empty`/`skip`/`error`）
+- `real_ingest.assemble.date_from` / `date_to` / `require_sources` / `max_columns_per_source`
+
+> 現在配布されているサンプル（1日分）は **trend の期間（07/29-30）と traceability/defect の期間（07/24-25）が
+> 重複していない**ため、`assemble` は毎回 WARN を出して trend 列を全 NaN で生成する（既定 `on_no_overlap: warn_empty`）。
+> これは実装の誤りではなく、期間が重複する実データが提供されるまで検証できない既知の制約（設計書 §8.4(4) / §13）。
 
 ## テスト
 

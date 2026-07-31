@@ -155,3 +155,103 @@ analysis:
   random_state: 42
   # EDA で層別に使う主な目的変数
   eda_target: has_defect
+
+# ---------------------------------------------------------------------
+# 実データ取り込み（docs/real_data_ingest_design.md）
+#   旧 ingest/integrate（合成データ経路）とは独立。CLI: convert / assemble
+# ---------------------------------------------------------------------
+real_ingest:
+  raw_dir: data/raw
+  lake_dir: data/lake                    # 変換済み Parquet レイク
+  manifest_path: data/lake/_manifest.json
+  panel_path: data/interim/vin_panel.parquet
+  kinds: [traceability, trend, defect, repair]   # repair は空でも可
+
+  # "{kind}/{source_key}" -> 別名（レイクのディレクトリ名・列接頭辞に使う）。
+  # repair/defect.csv のソース名が defect kind の "defect" と衝突するため解消する（R7）。
+  source_aliases:
+    repair/defect: 修正
+
+  convert:
+    encoding: utf-8-sig
+    encoding_fallbacks: ["cp932"]         # ヘッダ読取が UnicodeDecodeError のとき順に試す
+    datetime_format: "%Y/%m/%d %H:%M:%S"
+    chunksize: 200000
+    downcast_float: true
+    keep_float64_suffixes: ["積算値", "総合計"]   # 精度維持する列の末尾トークン
+    datetime_column_keywords: ["通過日時", "DATETIME"]
+    max_datetime_parse_failure_rate: 0.01        # 超過で WARN
+
+    # kind 単位の上書き（書かれていない kind は従来どおり）。docs/real_data_repair_design.md §2。
+    by_kind:
+      repair:
+        encoding: cp932
+        time_column: PB_ON           # date パーティションのアンカー（_resolve_time_column より優先。R3）
+        strip_apostrophe: true       # 全 object 列の先頭 "'" を1文字だけ除去（R2）
+        na_values: ["00000000 000000"]   # 日時パース前に NA へ置換する番兵
+        combine_datetime:            # 日付列＋時刻列 → 新規日時列
+          - {name: 修正日時, date_column: 修正日, time_column: 修正時間, format: "%Y/%m/%d %H:%M:%S"}
+        datetime_columns:            # datetime_column_keywords で拾えない日時列
+          - columns: [WB_ON, WB_OK, PB_ON, PB_OK, AB_ON, EG_OK, AB_OK, FC_OK]
+            format: "%Y%m%d %H%M%S"
+        pii:
+          columns: [修正員]
+          mode: hash                 # hash | drop | keep（R6）
+          salt: ""                   # 空なら環境変数 DEFECT_ANALYSIS_PII_SALT、それも無ければソルト無し
+          suffix: _id                # 修正員 -> 修正員_id
+
+  vin:
+    suffix_policy: keep        # keep（既定・別キー） | merge（vin_base で丸める）
+    exclude_regex: "(?i)(DUMMY|EMPTY)"
+
+  # ソース名（正規化後）ごとの上書き。複数行/VIN かどうかは自動判定されるため
+  # 宣言は不要（設計書 §8.1）。defaults と異なる集約方法にしたいソースのみ記入する。
+  #   例: 上塗ロボット: {aggs: [mean, min, max, std], pivot_by: [ロボット]}
+  sources: {}
+  defaults:
+    aggs: [mean, min, max, std]
+    pivot_by: []
+
+  defect:
+    size_column: 不良サイズ    # 正規化後の列名
+    kind_column: 不良種類
+    part_column: 検査部位
+    time_column: 入口_通過日時
+    by_kind: true              # 不良種類別カウント列を作る
+    by_part: false             # 検査部位別カウント列（列爆発するため既定 off）
+    drop_columns: [検査箇所]   # X/Y の冗長列
+
+  # repair（修正実績）ソースの VIN 集約設定。docs/real_data_repair_design.md §2/§3.3。
+  repair:
+    time_column: 修正日時            # first_ts / last_ts の元（convert の combine_datetime で生成）
+    production_time_column: PB_ON
+    workload_column: 修正工数
+    category_columns:                # 列 -> カウント展開するか
+      大分類: true
+      中分類: false
+      小分類: false
+      部品名: false
+      修正内容: false
+      部位: false
+    worker_column: 修正員_id         # pii.suffix 適用後の名前
+    max_category_columns: 30         # 展開後カウント列の合計上限。超過で ValueError
+
+  trend:
+    enabled: true
+    include_suffixes: ["測定値", "計算値"]   # 末尾トークン一致で採用
+    include_columns: []        # 非空ならこの明示リストのみ採用（include_suffixes より優先）
+    exclude_columns: []
+    mode: window               # window | point
+    window_minutes: 11         # 中心窓（±5分）。mode=window のとき有効
+    tolerance_minutes: 5       # merge_asof の許容差
+    aggs: [mean]
+    anchor_map: {}             # トークン -> traceability ソース名（規則で解決できない場合のみ記述）
+    fallback_anchor_source: ブース
+    on_no_overlap: warn_empty  # warn_empty | skip | error
+    min_match_rate: 0.5        # 下回ると WARN
+
+  assemble:
+    date_from: null            # "2026-07-24"（null で全期間）
+    date_to: null
+    require_sources: []        # 0 行なら ValueError にするソース名
+    max_columns_per_source: 200
