@@ -9,7 +9,7 @@ project:
   random_seed: 42
 
 paths:
-  raw_dir: data/raw            # 生成された分割 CSV 群
+  raw_dir: data/raw            # 旧 ingest/integrate 経路（合成データ想定）が読む分割 CSV 群
   interim_dir: data/interim    # 収集・統合済みの中間テーブル
   processed_dir: data/processed # 特徴量テーブル（分析用マート）
   reports_dir: reports         # データ辞書・サマリ
@@ -43,49 +43,6 @@ catalog:
   input_glob: "data/raw/**/*.csv"   # 走査対象（glob。ディレクトリ/単一ファイルも可）
   output_path: reports/data_catalog.yaml
   datetime_detect_ratio: 0.9        # object列を日時とみなす最小パース成功率
-
-# ---------------------------------------------------------------------
-# 合成データ生成（実データが来たら generate 工程を差し替えるだけで良い）
-# ---------------------------------------------------------------------
-synthesize:
-  n_vin: 2000
-  months: ["2026-01", "2026-02", "2026-03"]
-  plant: P01
-  lines: ["L-A", "L-B"]
-  operators: ["op_sato", "op_suzuki", "op_takahashi", "op_tanaka", "op_ito", "op_yamada"]
-  trend_rel_std: 0.08          # 各測定値の相対ばらつき（平均に対する比）
-  driver_gain: 1.2             # VIN 品質潜在変数がドライバ測定値を動かす強さ
-
-  # 設備（工程）定義。工程順にこのリストの順で通過する。
-  # trend_means: その設備で測定する数値項目の平均値。
-  equipments:
-    - id: EQ-01
-      name: 圧入
-      trend_means: {torque: 45.0, temperature: 25.0, pressure: 80.0, vibration: 1.5}
-    - id: EQ-02
-      name: 締結
-      trend_means: {torque: 60.0, temperature: 26.0, pressure: 20.0, vibration: 1.2}
-    - id: EQ-03
-      name: 塗布
-      trend_means: {torque: 5.0, temperature: 40.0, pressure: 15.0, vibration: 0.8}
-    - id: EQ-04
-      name: 溶接
-      trend_means: {torque: 8.0, temperature: 120.0, pressure: 10.0, vibration: 3.0}
-    - id: EQ-05
-      name: 検査
-      trend_means: {torque: 2.0, temperature: 24.0, pressure: 5.0, vibration: 0.5}
-
-  # 不良の発生機構：どの設備のどの測定値が高いとどの不良を招くか（信号注入）。
-  # これにより後段の統計/機械学習で実際に検出可能な因果が生まれる。
-  defect_drivers:
-    - {equipment_id: EQ-01, measure: pressure,    category: 寸法不良, slope: 1.1, intercept: -2.6, severity_weights: [0.6, 0.3, 0.1]}
-    - {equipment_id: EQ-02, measure: torque,      category: 組付不良, slope: 1.3, intercept: -2.7, severity_weights: [0.4, 0.4, 0.2]}
-    - {equipment_id: EQ-03, measure: temperature, category: 外観不良, slope: 1.0, intercept: -2.8, severity_weights: [0.7, 0.25, 0.05]}
-    - {equipment_id: EQ-04, measure: vibration,   category: 機能不良, slope: 1.5, intercept: -2.9, severity_weights: [0.2, 0.4, 0.4]}
-  # 上記ドライバに依らない偶発不良（その他）の基準確率
-  random_defect_rate: 0.02
-  # 不良ありVINが修正される割合（修正データは 0..1 の基数を保つ）
-  repair_rate_given_defect: 0.7
 
 # ---------------------------------------------------------------------
 # 特徴量作成・カテゴリ統合

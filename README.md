@@ -7,11 +7,12 @@
 **ステップ1〜3（データ集計・統合・特徴量作成）** まで。以降のグラフ・統計・機械学習は
 生成済みの特徴量マート（`data/processed/features`）を入力に追加していく。
 
-> **2経路が並存している。** 以下の「合成データ経路」（`generate`→`ingest`→`integrate`→`features`、
-> 89本のテストで担保）は動作確認用の**廃止候補**。実データを使う場合は本書後半の
+> **2経路が並存している。** 以下の「旧経路」（`ingest`→`integrate`→`features`、テストで担保）は
+> 合成データ生成（`generate.py`）を前提に作られていたが、合成データ生成は廃止した。
+> データは `data/raw` に手動で用意する必要がある。実データを使う場合は本書後半の
 > 「実データ経路（`convert` / `assemble`）」を使うこと（詳細設計は
-> [docs/real_data_ingest_design.md](docs/real_data_ingest_design.md)）。実データパネルが
-> 下流（eda/stats/ml）に接続できた時点で、合成データ経路は次フェーズで削除する。
+> [docs/real_data_ingest_design.md](docs/real_data_ingest_design.md)）。旧経路（ingest/integrate/
+> features/eda/stats/ml）は実データパネルへの接続待ちの**廃止候補**。
 
 ## データモデル（VIN 基数）
 
@@ -25,7 +26,6 @@
 ## パイプライン工程
 
 ```text
-generate  → 合成データ生成（実データ導入時はこの工程を差し替える）
 ingest    → 分割CSV群の自動収集・統合（ステップ1）        data/raw → data/interim
 integrate → VIN軸で不良集約・修正結合し分析用マート化（ステップ2） → data/interim/vin_master
 features  → 特徴量作成・カテゴリ統合・データ辞書出力（ステップ3）   → data/processed/features
@@ -43,7 +43,6 @@ src/defect_analysis/
   config.py                 設定読込とパス解決
   logging_utils.py          ログ設定（コンソール+ファイル）
   io_utils.py               parquet/csv 入出力（pyarrow 未導入時は csv に自動フォールバック）
-  generate.py               合成データ生成（信号注入つき）
   ingest.py                 ステップ1: 収集・統合
   integrate.py              ステップ2: VIN軸統合
   features.py               ステップ3: 特徴量作成
@@ -85,21 +84,19 @@ uv add pyarrow
 ## 使い方
 
 ```bash
-uv run python main.py all           # generate → ingest → integrate → features を順に実行
-uv run python main.py generate      # 合成データのみ生成
+uv run python main.py all           # ingest → integrate → features を順に実行
 uv run python main.py ingest        # ステップ1のみ
 uv run python main.py integrate     # ステップ2のみ
 uv run python main.py features      # ステップ3のみ
 uv run python main.py all --config config/config.yaml --log-level DEBUG
 ```
 
-> **`data/raw` は実データ用。** `paths.raw_dir`（`generate` の書き込み先）と
-> `real_ingest.raw_dir`（`convert` の読込元）は既定で同じ `data/raw` を指す。実データを
-> `data/raw` に置いて運用する場合、`generate`（合成データ生成）を使うと実データへの混入を
-> 避けるため中断される（`data/raw/{traceability,trend,defect,repair}/` に generate 由来でない
-> CSV が既にある場合の書き込み前ガード）。合成データ経路を使う場合は `paths.raw_dir` を
-> 実データとは別のディレクトリに変更するか、強制的に上書きするなら
-> `python main.py generate --force` を使うこと。
+> **`data/raw` は実データ用。** `paths.raw_dir`（旧経路 `ingest` の読込元）と
+> `real_ingest.raw_dir`（`convert` の読込元）は既定で同じ `data/raw` を指す。旧経路を
+> 動かす場合は合成データ相当の CSV（`EQ-01_2026-01.csv` 等の命名・内部 `equipment_id`/`vin` 列あり）
+> を別途 `data/raw` 配下に用意すること。実データと混在させると `ingest` のファイル名正規表現に
+> 一致せずスキップされるだけで実データが壊れることはないが、意図しない取り込み漏れを避けるため
+> `paths.raw_dir` を実データとは別ディレクトリに変更することを推奨する。
 
 ### ユーティリティ
 
@@ -223,7 +220,7 @@ analysis:
 ## 実データ経路（`convert` / `assemble`）
 
 `data/raw/{traceability,trend,defect,repair}/*.csv` の**実データ**を VIN 単位の分析用パネル
-`data/interim/vin_panel.parquet` にするための経路。上記の合成データ経路（`generate`〜`features`）
+`data/interim/vin_panel.parquet` にするための経路。上記の旧経路（`ingest`〜`features`）
 とは完全に独立しており、出力先も別（`data/lake/` / `data/interim/vin_panel.parquet`）。
 詳細設計は [docs/real_data_ingest_design.md](docs/real_data_ingest_design.md)、
 実データの実測事実は [docs/real_data_facts.md](docs/real_data_facts.md)。
@@ -272,9 +269,20 @@ VIN）を扱う場合は `--date-from`/`--date-to` と `real_ingest.trend.includ
 | `reports/trend_anchor_map.csv` | trend 列トークン → アンカーとなる traceability ソース・列・解決経路 |
 | `reports/trend_join_report.csv` | アンカー別の trend マッチ率と期間 |
 
+> **ブツ検にレコードが無い VIN の扱い（確定・2026-07-31）**: 「不良ゼロ」ではなく「未検査」として扱う。
+> `defect_{source}__count` / `__has` / `__kind__*` / `__part__*` は、その VIN が defect ソースに
+> 一切登場しない場合は **0 埋めせず NaN のまま**残す（`prepare_defect_source` 内で「その VIN は
+> 登場するが特定の種類が無い」場合の 0 埋めは従来どおり行う。区別されるのは「登場すらしない」場合のみ）。
+>
+> **`has_repair_record` 列**: `assemble` は全ての `repair_*__has` 列（複数 repair ソースがあれば
+> それらの OR）から VIN 単位の修正記録有無フラグ `has_repair_record`（0/1, int）をパネルに追加する。
+> `has_repair` が `analysis.leakage_prefixes` に含まれるため ML 特徴量からは自動除外される
+> （EDA での可視化には使ってよいが、予測の説明変数には使わないこと）。
+
 ### config（`real_ingest:` セクション）の主なキー
 
-- `real_ingest.vin.suffix_policy`: VIN サフィックス（`a`/`b`/`c`）の扱い。`keep`（既定・別キー） | `merge`（`vin_base` に丸める）
+- `real_ingest.vin.suffix_policy`: VIN サフィックス（`a`/`b`/`c`。同一車体の2回目以降の通過を意味する
+  ことが確認済み）の扱い。`keep`（既定・別キー） | `merge`（`vin_base` に丸める）
 - `real_ingest.sources` / `defaults`: 複数行/VIN ソース（自動判定・宣言不要）の集約方法（`aggs`）・pivot 列（`pivot_by`）。`sources` は defaults と異なる挙動にしたいソースのみ上書き記入する
 - `real_ingest.defect`: 不良サイズ/種類/検査部位の列名、種類別カウント列を作るか（`by_kind`）
 - `real_ingest.repair`: repair（修正実績）の VIN 集約設定。`time_column`（`修正日時`）/

@@ -149,7 +149,7 @@ def integrate(cfg: Config) -> dict[str, int]:
     repair = load_df(table_path(interim_dir, "repair", fmt), parse_dates=["repair_date"])
 
     if trace.empty:
-        raise ValueError("traceability が空です。先に generate/ingest を実行してください。")
+        raise ValueError("traceability が空です。先に ingest を実行してください。")
 
     base = _aggregate_traceability(trace)
     trend_wide = _widen_trend(trend)

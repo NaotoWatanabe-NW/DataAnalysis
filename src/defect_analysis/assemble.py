@@ -340,7 +340,9 @@ def prepare_repair_source(df: pd.DataFrame, source: str, cfg: Config) -> pd.Data
         result = result.join(workload_stats)
         if workload_numeric.fillna(0).eq(0).all():
             logger.warning(
-                "[repair/%s] %s が全て 0 です。この期間では特徴量になりません", source, workload_col,
+                "[repair/%s] %s が全て 0 です（入力員が未入力のため。ユーザー確認済み・2026-07-31）。"
+                "実測値ではなく未入力を表すため、この期間では特徴量として使わないこと。",
+                source, workload_col,
             )
 
     n_category_columns = 0
@@ -420,6 +422,20 @@ def _zero_fill_after_merge(
     for c in new_cols:
         if c in (f"{p}__has", f"{p}__count") or any(infix in c for infix in count_infixes):
             base[c] = base[c].fillna(0)
+
+
+def _add_has_repair_record(base: pd.DataFrame) -> pd.DataFrame:
+    """VIN のリペア記録有無フラグ `has_repair_record` を追加する。
+
+    複数の repair ソースが存在する場合はいずれかに記録があれば 1。repair ソースが
+    無ければ列を追加しない。列名が既存 `analysis.leakage_prefixes` の `has_repair` に
+    一致するため、ML 特徴量からは追加設定なしで自動的に除外される。
+    """
+    has_cols = [c for c in base.columns if c.startswith("repair_") and c.endswith("__has")]
+    if not has_cols:
+        return base
+    base["has_repair_record"] = base[has_cols].fillna(0).max(axis=1).astype(int)
+    return base
 
 
 # ---------------------------------------------------------------------
@@ -890,8 +906,12 @@ def assemble(cfg: Config, *, date_from: str | None = None, date_to: str | None =
                 f"__{col}__" for col, enabled in repair_cfg["category_columns"].items() if enabled
             )
             _zero_fill_after_merge(base, before_cols, name, prefix="repair", count_infixes=count_infixes)
-        else:
-            _zero_fill_after_merge(base, before_cols, name, prefix="defect", count_infixes=("__kind__", "__part__"))
+        # defect: レコード欠如は「未検査（unknown）」であり「不良ゼロ」と断定できないため
+        # 0 埋めしない（ユーザー判断 2026-07-31。docs/real_data_ingest_design.md §13-7 参照）。
+        # NaN のまま残すことで「不良ゼロ」と「未検査」を区別できるようにする。
+        # traceability は present__{name} で存在有無を既に表現しているため対象外（従来から no-op）。
+
+    base = _add_has_repair_record(base)
 
     _write_report(reports_dir, "ingest_quality.csv", pd.DataFrame(quality_rows))
 

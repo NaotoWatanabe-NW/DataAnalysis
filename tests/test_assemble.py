@@ -491,5 +491,113 @@ class AssembleRepairEndToEndTest(unittest.TestCase):
         self.assertAlmostEqual(float(panel.loc["B", "repair_修正__lead_time_h"]), expected_hours, places=2)
 
 
+class AssembleDefectNotInspectedAndHasRepairRecordTest(unittest.TestCase):
+    """defect レコード欠如は「未検査」として NaN のまま残し、`has_repair_record` を検証する。
+
+    ユーザー判断（2026-07-31）: ブツ検にレコードが無い VIN は「不良ゼロ」と断定できないため
+    0 埋めしない（`docs/real_data_ingest_design.md` §13-7 の未確定事項が確定した）。
+    traceability に A・B・C、defect に A のみ、repair に A のみが居る fixture。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _cfg(self) -> Config:
+        data = {
+            "real_ingest": {
+                "raw_dir": str(self.tmp_path / "raw"),
+                "lake_dir": str(self.tmp_path / "lake"),
+                "manifest_path": str(self.tmp_path / "lake" / "_manifest.json"),
+                "panel_path": str(self.tmp_path / "interim" / "vin_panel.parquet"),
+                "trend": {"on_no_overlap": "skip"},
+            },
+            "paths": {"reports_dir": str(self.tmp_path / "reports")},
+        }
+        return Config(data, root=self.tmp_path)
+
+    def _write_fixture(self) -> None:
+        raw_dir = self.tmp_path / "raw"
+        trace_sub = raw_dir / "traceability"
+        trace_sub.mkdir(parents=True)
+        pd.DataFrame(
+            {
+                "VIN#": ["A", "B", "C"],
+                "通過日時": ["2026/07/24 10:00:00", "2026/07/24 11:00:00", "2026/07/24 12:00:00"],
+            }
+        ).to_csv(trace_sub / "ブース.csv", index=False, encoding="utf-8-sig")
+
+        defect_sub = raw_dir / "defect"
+        defect_sub.mkdir(parents=True)
+        pd.DataFrame(
+            {
+                "VIN#": ["A", "A"],
+                "入口 通過日時": ["2026/07/24 10:05:00", "2026/07/24 10:06:00"],
+                "不良ｻｲｽﾞ": ["3.2", "4.1"],
+                "検査部位": ["左前ﾌｪﾝﾀﾞｰ", "右後ﾄﾞｱ"],
+                "不良種類": ["凸不良", "平面不良"],
+            }
+        ).to_csv(defect_sub / "上塗ブツ検.csv", index=False, encoding="utf-8-sig")
+
+        repair_sub = raw_dir / "repair"
+        repair_sub.mkdir(parents=True)
+        pd.DataFrame(
+            {
+                "VIN": ["A"],
+                "修正日": ["2026/07/29"],
+                "修正時間": ["06:41:46"],
+                "PB-ON": ["20260724 010931"],
+                "大分類": ["上塗り"],
+                "修正工数": [0],
+            }
+        ).to_csv(repair_sub / "defect.csv", index=False, encoding="cp932")
+
+    def test_defect_absence_leaves_count_and_has_as_nan_not_zero(self):
+        self._write_fixture()
+        cfg = self._cfg()
+        convert_all(cfg)
+        assemble(cfg)
+
+        panel = pd.read_parquet(self.tmp_path / "interim" / "vin_panel.parquet").set_index("vin")
+
+        # A は検査記録あり: 実件数がそのまま入る
+        self.assertEqual(panel.loc["A", "defect_上塗ブツ検__count"], 2)
+        self.assertEqual(panel.loc["A", "defect_上塗ブツ検__has"], 1)
+
+        # B・C は defect データに一切登場しない = 「未検査」であり「不良ゼロ」ではないため NaN
+        self.assertTrue(pd.isna(panel.loc["B", "defect_上塗ブツ検__count"]))
+        self.assertTrue(pd.isna(panel.loc["B", "defect_上塗ブツ検__has"]))
+        self.assertTrue(pd.isna(panel.loc["C", "defect_上塗ブツ検__count"]))
+        self.assertTrue(pd.isna(panel.loc["C", "defect_上塗ブツ検__has"]))
+
+    def test_defect_kind_crosstab_columns_are_nan_for_uninspected_vin_not_zero(self):
+        self._write_fixture()
+        cfg = self._cfg()
+        convert_all(cfg)
+        assemble(cfg)
+
+        panel = pd.read_parquet(self.tmp_path / "interim" / "vin_panel.parquet").set_index("vin")
+
+        self.assertEqual(panel.loc["A", "defect_上塗ブツ検__kind__凸不良"], 1)
+        self.assertTrue(pd.isna(panel.loc["B", "defect_上塗ブツ検__kind__凸不良"]))
+        self.assertTrue(pd.isna(panel.loc["C", "defect_上塗ブツ検__kind__凸不良"]))
+
+    def test_has_repair_record_is_one_only_for_vins_with_a_repair_row(self):
+        self._write_fixture()
+        cfg = self._cfg()
+        convert_all(cfg)
+        assemble(cfg)
+
+        panel = pd.read_parquet(self.tmp_path / "interim" / "vin_panel.parquet").set_index("vin")
+
+        self.assertEqual(panel.loc["A", "has_repair_record"], 1)
+        self.assertEqual(panel.loc["B", "has_repair_record"], 0)
+        self.assertEqual(panel.loc["C", "has_repair_record"], 0)
+        self.assertEqual(panel["has_repair_record"].dtype, np.int64)
+
+
 if __name__ == "__main__":
     unittest.main()

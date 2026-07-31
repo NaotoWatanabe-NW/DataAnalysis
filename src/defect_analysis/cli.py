@@ -1,8 +1,7 @@
 """コマンドラインインターフェース（サブコマンド方式）。
 
-パイプライン工程（合成データ経路）:
-    python main.py all                 # generate -> ingest -> integrate -> features
-    python main.py generate            # 合成データ生成
+パイプライン工程（旧経路。データは data/raw に手動で用意する）:
+    python main.py all                 # ingest -> integrate -> features
     python main.py ingest              # 分割CSV収集・統合（ステップ1）
     python main.py integrate           # VIN軸で結合（ステップ2）
     python main.py features            # 特徴量作成（ステップ3）
@@ -27,7 +26,6 @@ import logging
 
 from .config import Config
 from .features import build_features
-from .generate import generate
 from .ingest import ingest
 from .integrate import integrate
 from .logging_utils import setup_logging
@@ -36,12 +34,11 @@ logger = logging.getLogger(__name__)
 
 # 工程名 -> 実行関数（Config を受け取り dict を返す）
 STAGES = {
-    "generate": generate,
     "ingest": ingest,
     "integrate": integrate,
     "features": build_features,
 }
-ALL_ORDER = ["generate", "ingest", "integrate", "features"]
+ALL_ORDER = ["ingest", "integrate", "features"]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -58,12 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("all", parents=[common], help="全工程を順に実行")
     for stage in ALL_ORDER:
-        p_stage = sub.add_parser(stage, parents=[common], help=f"{stage} 工程のみ実行")
-        if stage == "generate":
-            p_stage.add_argument(
-                "--force", action="store_true",
-                help="paths.raw_dir に既存ファイルがあっても上書きを許可する（実データ混入ガードを無視）",
-            )
+        sub.add_parser(stage, parents=[common], help=f"{stage} 工程のみ実行")
 
     p_catalog = sub.add_parser("catalog", parents=[common], help="CSVのスキーマを YAML カタログに記録")
     p_catalog.add_argument("--input", default=None, help="対象glob/ディレクトリ/ファイル（既定: catalog.input_glob）")
@@ -105,9 +97,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = Config.load(args.config)
     setup_logging(cfg.path("paths.logs_dir", create=True), getattr(logging, args.log_level.upper(), logging.INFO))
 
-    if args.command == "generate":
-        generate(cfg, force=args.force)
-    elif args.command in STAGES or args.command == "all":
+    if args.command in STAGES or args.command == "all":
         run_pipeline(args.command, cfg)
     elif args.command == "catalog":
         from .schema_catalog import build_catalog
