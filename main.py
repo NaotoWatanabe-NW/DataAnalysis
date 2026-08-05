@@ -1,9 +1,9 @@
 """エントリポイント。src/ をパスに追加してCLIを起動する。
 
 例:
-    python main.py all
-    python main.py generate
-    python main.py features --config config/config.yaml
+    python main.py convert
+    python main.py assemble
+    python main.py eda
 """
 
 import sys

@@ -3,16 +3,9 @@
 設備トレーサビリティ・設備トレンド・不良・修正の4データを **VIN を主キー** に統合・加工し、
 不良原因の追求（可視化・統計・機械学習）につなげるためのパイプライン。
 
-現時点の実装範囲は設計書 [docs/first_design.md](docs/first_design.md) の
-**ステップ1〜3（データ集計・統合・特徴量作成）** まで。以降のグラフ・統計・機械学習は
-生成済みの特徴量マート（`data/processed/features`）を入力に追加していく。
-
-> **2経路が並存している。** 以下の「旧経路」（`ingest`→`integrate`→`features`、テストで担保）は
-> 合成データ生成（`generate.py`）を前提に作られていたが、合成データ生成は廃止した。
-> データは `data/raw` に手動で用意する必要がある。実データを使う場合は本書後半の
-> 「実データ経路（`convert` / `assemble`）」を使うこと（詳細設計は
-> [docs/real_data_ingest_design.md](docs/real_data_ingest_design.md)）。旧経路（ingest/integrate/
-> features/eda/stats/ml）は実データパネルへの接続待ちの**廃止候補**。
+実データ（`data/raw` 配下の CSV）を `convert` → `assemble` で VIN 単位のパネル
+（`data/interim/vin_panel.parquet`）にまとめ、`eda` / `stats` / `ml` で分析する。
+詳細設計は [docs/real_data_ingest_design.md](docs/real_data_ingest_design.md)。
 
 ## データモデル（VIN 基数）
 
@@ -23,18 +16,6 @@
 | 不良 | 月ごと CSV | 1:N（無い VIN は行なし） | `data/raw/defect/` |
 | 修正 | 月ごと CSV | 0..N（修正なしは行なし。実データでは最大5行/VIN） | `data/raw/repair/` |
 
-## パイプライン工程
-
-```text
-ingest    → 分割CSV群の自動収集・統合（ステップ1）        data/raw → data/interim
-integrate → VIN軸で不良集約・修正結合し分析用マート化（ステップ2） → data/interim/vin_master
-features  → 特徴量作成・カテゴリ統合・データ辞書出力（ステップ3）   → data/processed/features
-```
-
-> `ingest` は実データの列名ゆらぎを `config.yaml` の `ingest.column_maps`
-> （ソース別に「生列名 → 標準列名」を指定）で読込直後に吸収してから、必須列チェック・収集を行う。
-> マップ未指定なら CSV の列名をそのまま標準列名として扱う（従来どおり）。
-
 ## ディレクトリ構成
 
 ```text
@@ -43,9 +24,6 @@ src/defect_analysis/
   config.py                 設定読込とパス解決
   logging_utils.py          ログ設定（コンソール+ファイル）
   io_utils.py               parquet/csv 入出力（pyarrow 未導入時は csv に自動フォールバック）
-  ingest.py                 ステップ1: 収集・統合
-  integrate.py              ステップ2: VIN軸統合
-  features.py               ステップ3: 特徴量作成
   eda.py                    ステップ4: EDAグラフ生成
   stats_tests.py            ステップ5: 統計検定（相関・群間差）
   ml.py                     ステップ6: 機械学習（LightGBM主軸）
@@ -63,7 +41,7 @@ config/category_map.yaml    統合カテゴリの変換ルール
 data/sample/                サンプル入力（大/中/小カテゴリ）
 tests/test_transforms.py    コア変換ロジックのテスト（unittest）
 main.py                     エントリポイント
-data/                       raw / lake / interim / processed（git 管理外）
+data/                       raw / lake / interim（git 管理外）
 reports/                    データ辞書・カタログ・数値サマリ（git 管理外）
 ```
 
@@ -82,21 +60,6 @@ uv add pyarrow
 ```
 
 ## 使い方
-
-```bash
-uv run python main.py all           # ingest → integrate → features を順に実行
-uv run python main.py ingest        # ステップ1のみ
-uv run python main.py integrate     # ステップ2のみ
-uv run python main.py features      # ステップ3のみ
-uv run python main.py all --config config/config.yaml --log-level DEBUG
-```
-
-> **`data/raw` は実データ用。** `paths.raw_dir`（旧経路 `ingest` の読込元）と
-> `real_ingest.raw_dir`（`convert` の読込元）は既定で同じ `data/raw` を指す。旧経路を
-> 動かす場合は合成データ相当の CSV（`EQ-01_2026-01.csv` 等の命名・内部 `equipment_id`/`vin` 列あり）
-> を別途 `data/raw` 配下に用意すること。実データと混在させると `ingest` のファイル名正規表現に
-> 一致せずスキップされるだけで実データが壊れることはないが、意図しない取り込み漏れを避けるため
-> `paths.raw_dir` を実データとは別ディレクトリに変更することを推奨する。
 
 ### ユーティリティ
 
@@ -124,8 +87,8 @@ uv run python main.py category \
 
 ### 分析ステージ（EDA → 統計 → 機械学習）
 
-`data/processed/features` を入力に、設計書ステップ4〜6を実行する。**不良/修正の結果由来列は
-リークとして説明変数から除外**し（[config.yaml](config/config.yaml) の `analysis`）、
+`data/interim/vin_panel.parquet`（`assemble` の出力）を入力に、設計書ステップ4〜6を実行する。
+**不良/修正の結果由来列はリークとして説明変数から除外**し（[config.yaml](config/config.yaml) の `analysis`）、
 「工程データ（トレンド・通過時間・設備・時間帯）から不良を説明/予測できるか」を検証する。
 
 ```bash
@@ -147,7 +110,7 @@ uv run python main.py ml       # ステップ6: 機械学習（ベースライ�
 
 #### フィルタで対象を絞る（`analysis.filters`）
 
-`config.yaml` の `analysis.filters` にフィルタ句を並べると、`load_features` の読込直後に
+`config.yaml` の `analysis.filters` にフィルタ句を並べると、`load_real_panel` の読込直後に
 **AND 適用**され、**EDA・統計・機械学習の全ステージに同時に効く**（未指定なら全件で従来どおり）。
 絞り込んだ条件はグラフ脚注の「データ範囲」にも自動反映される。設計は
 [docs/filter_and_annotation_design.md](docs/filter_and_annotation_design.md)。
@@ -173,11 +136,6 @@ analysis:
 
 | パス | 内容 |
 |---|---|
-| `data/interim/{traceability,trend,defect,repair}` | 収集・統合済みの各ソース |
-| `data/interim/vin_master` | VIN 単位の統合マート |
-| `data/processed/features` | 特徴量テーブル（分析・モデリングの入力） |
-| `reports/feature_dictionary.csv` | 各列の型・欠損・ユニーク数・例 |
-| `reports/feature_summary.csv` | 数値特徴量の統計サマリ |
 | `reports/eda/*.png` | EDA グラフ（全体4図＋設備別の箱ひげ/ヒートマップ。設備数に追従、脚注つき） |
 | `reports/stats/statistical_tests.csv` / `statistical_summary.md` | 統計検定結果・サマリ |
 | `reports/ml/model_performance.csv` | 交差検証の性能比較 |
@@ -185,43 +143,20 @@ analysis:
 | `reports/ml/*.png` | モデル比較・ROC/PR・予測vs実測・重要度の図（脚注つき） |
 | `logs/pipeline.log` | 実行ログ |
 
-## 特徴量マートの主な列（`data/processed/features`）
-
-- **識別/属性**: `vin`, `plant_code`, `line_code`, `operator`, `lot_no`, `process_month`
-- **設備トレンド（設備×測定値ワイド）**: `EQ-01__torque` … `EQ-05__vibration`
-- **通過時間**: 設備別通過時間 `EQ-01__pass_sec` …、正味加工 `total_cycle_time_sec`、
-  リードタイム `lead_time_sec`、工程間滞留（通過時間の差）`wait_time_sec` / `wait_ratio` /
-  `max_gap_sec` / `mean_gap_sec`
-- **生産時間帯**: `production_hour`, `production_shift`(1直/2直/3直), `production_dayofweek`, `is_weekend`
-- **不良**: 総数 `defect_count`、種類数 `defect_type_count`、**種類別カウント** `defect_cnt_<カテゴリ>`、
-  重大 `severe_defect_count` / `has_severe_defect`、`max_severity`, `severity_sum`, `top_defect_category`(+大分類)
-- **修正**: **修正履歴の有無** `has_repair`（修正データの有無で判定）、`repair_action`, `repair_time_min`, `time_to_repair_days`
-- **ターゲット候補**: `has_defect`, `has_severe_defect`, `defect_count`, `has_repair`
-
 ## 設定（config.yaml の主なキー）
 
-- `synthesize`: 合成データの規模・設備定義・不良ドライバ（信号注入）・修正率
-- `features.severe_defect_level`: 重大不良とみなす severity の下限
-- `features.rare_category_threshold`: 低頻度カテゴリを `OTHER` に集約する閾値
-- `features.outlier_clip_quantiles`: 数値特徴量のクリップ分位（`null` で無効）
-- `features.defect_category_coarse_map`: 不良細分類→大分類の統合マップ（キー集合が種類別カウント列 `defect_cnt_*` を固定生成する）
 - `storage.format`: `parquet` | `csv`
 - `analysis.targets`: 分類/回帰の目的変数
 - `analysis.filters` / `filters_on_missing_column`: 分析対象の行フィルタ（EDA/統計/ML 共通。上記「フィルタで対象を絞る」参照）
 - `analysis.leakage_columns` / `leakage_prefixes` / `leakage_regex`: 説明変数から除外する結果由来列
   （明示リスト＋接頭辞＋正規表現の規約で自動除外。新しい結果列が増えても規約で拾えるようにしリーク防止）
 - `analysis.cv_folds` / `test_size` / `random_state`: 交差検証・保持テストの設定
-- `ingest.column_maps`: 取り込み時の列名正規化（ソース別に「生列名 → 標準列名」を指定）
 - `catalog.input_glob` / `output_path`: データカタログの対象と出力先
-
-合成データには「設備トレンドのドライバ測定値 → 対応する不良」という因果を注入しており
-（例: 溶接 EQ-04 の振動増大 → 機能不良）、後段の統計検定・機械学習で実際に検出可能な信号になる。
 
 ## 実データ経路（`convert` / `assemble`）
 
 `data/raw/{traceability,trend,defect,repair}/*.csv` の**実データ**を VIN 単位の分析用パネル
-`data/interim/vin_panel.parquet` にするための経路。上記の旧経路（`ingest`〜`features`）
-とは完全に独立しており、出力先も別（`data/lake/` / `data/interim/vin_panel.parquet`）。
+`data/interim/vin_panel.parquet` にするための経路（出力先: `data/lake/` / `data/interim/vin_panel.parquet`）。
 詳細設計は [docs/real_data_ingest_design.md](docs/real_data_ingest_design.md)、
 実データの実測事実は [docs/real_data_facts.md](docs/real_data_facts.md)。
 
@@ -309,11 +244,10 @@ VIN）を扱う場合は `--date-from`/`--date-to` と `real_ingest.trend.includ
 
 コア変換ロジック（`test_transforms.py`, unittest）に加え、フィルタ（`test_filters.py`）・
 グラフ注記（`test_annotation.py`, `test_viz.py`）・設備グルーピング（`test_equipment_groups.py`）・
-リーク規約（`test_predictors.py`）・ingest 列名リネーム（`test_ingest_rename.py`）を pytest で検証する。
+リーク規約（`test_predictors.py`）を pytest で検証する。
 
 ## 実装状況（設計書ステップ）
 
-- ✅ ステップ1〜3: 収集・統合・特徴量作成（`ingest` / `integrate` / `features`）
 - ✅ ステップ4〜6: EDA・統計検定・機械学習（`eda` / `stats` / `ml`）
 - ⬜ ステップ7: 深層学習（LSTM 等）— LightGBM 基準を上回る場合のみ採用
 - ⬜ ステップ8: 運用・自動化（定期実行・設定外部化の拡充）

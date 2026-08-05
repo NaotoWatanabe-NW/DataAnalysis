@@ -1,11 +1,5 @@
 """コマンドラインインターフェース（サブコマンド方式）。
 
-パイプライン工程（旧経路。データは data/raw に手動で用意する）:
-    python main.py all                 # ingest -> integrate -> features
-    python main.py ingest              # 分割CSV収集・統合（ステップ1）
-    python main.py integrate           # VIN軸で結合（ステップ2）
-    python main.py features            # 特徴量作成（ステップ3）
-
 実データ経路（docs/real_data_ingest_design.md）:
     python main.py convert [--force]                       # raw CSV -> data/lake/ Parquet
     python main.py assemble [--date-from] [--date-to]       # data/lake/ -> data/interim/vin_panel.parquet
@@ -25,20 +19,9 @@ import argparse
 import logging
 
 from .config import Config
-from .features import build_features
-from .ingest import ingest
-from .integrate import integrate
 from .logging_utils import setup_logging
 
 logger = logging.getLogger(__name__)
-
-# 工程名 -> 実行関数（Config を受け取り dict を返す）
-STAGES = {
-    "ingest": ingest,
-    "integrate": integrate,
-    "features": build_features,
-}
-ALL_ORDER = ["ingest", "integrate", "features"]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -52,10 +35,6 @@ def build_parser() -> argparse.ArgumentParser:
         description="VINを主キーに設備データ・不良・修正を統合し不良原因を追求するパイプライン",
     )
     sub = parser.add_subparsers(dest="command", required=True)
-
-    sub.add_parser("all", parents=[common], help="全工程を順に実行")
-    for stage in ALL_ORDER:
-        sub.add_parser(stage, parents=[common], help=f"{stage} 工程のみ実行")
 
     p_catalog = sub.add_parser("catalog", parents=[common], help="CSVのスキーマを YAML カタログに記録")
     p_catalog.add_argument("--input", default=None, help="対象glob/ディレクトリ/ファイル（既定: catalog.input_glob）")
@@ -74,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_assemble.add_argument("--date-from", default=None, help="対象期間の開始日（YYYY-MM-DD）。未指定なら config の設定 or 全期間")
     p_assemble.add_argument("--date-to", default=None, help="対象期間の終了日（YYYY-MM-DD）。未指定なら config の設定 or 全期間")
 
-    # 分析ステージ（features 生成後に実行）
+    # 分析ステージ（assemble 実行後に実行）
     sub.add_parser("eda", parents=[common], help="ステップ4: EDAグラフ生成")
     sub.add_parser("stats", parents=[common], help="ステップ5: 統計検定（相関・群間差）")
     sub.add_parser("ml", parents=[common], help="ステップ6: 機械学習（LightGBM主軸）")
@@ -82,24 +61,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run_pipeline(command: str, cfg: Config) -> dict:
-    """パイプライン工程（all または個別工程）を実行する。"""
-    stages = ALL_ORDER if command == "all" else [command]
-    results: dict[str, dict] = {}
-    for stage in stages:
-        logger.info("=== 工程開始: %s ===", stage)
-        results[stage] = STAGES[stage](cfg)
-    return results
-
-
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg = Config.load(args.config)
     setup_logging(cfg.path("paths.logs_dir", create=True), getattr(logging, args.log_level.upper(), logging.INFO))
 
-    if args.command in STAGES or args.command == "all":
-        run_pipeline(args.command, cfg)
-    elif args.command == "catalog":
+    if args.command == "catalog":
         from .schema_catalog import build_catalog
 
         build_catalog(cfg, input_glob=args.input, output_path=args.output)

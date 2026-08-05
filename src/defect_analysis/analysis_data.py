@@ -16,11 +16,9 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from .config import Config
-from .io_utils import load_df, resolve_format, table_path
 
 logger = logging.getLogger(__name__)
 
-_DATE_COLS = ["first_in_ts", "last_out_ts", "first_defect_date", "last_defect_date", "repair_date"]
 _FILTER_OPS = ("eq", "in", "not_in", "min", "max")
 
 
@@ -32,18 +30,6 @@ class FeatureSpec:
     @property
     def all(self) -> list[str]:
         return self.numeric + self.categorical
-
-
-def load_features(cfg: Config) -> pd.DataFrame:
-    """processed/features を読み込み、analysis.filters を適用して返す。
-
-    旧経路（generate/ingest/integrate/features）専用。stats/ml はこちらを使い続ける。
-    """
-    processed_dir = cfg.path("paths.processed_dir")
-    fmt = resolve_format(cfg.get("storage.format", "parquet"))
-    df = load_df(table_path(processed_dir, "features", fmt), parse_dates=_DATE_COLS)
-    df = apply_filters(df, cfg)
-    return df
 
 
 def load_real_panel(cfg: Config) -> pd.DataFrame:
@@ -235,7 +221,7 @@ def build_annotation_meta(df: pd.DataFrame, cfg: Config) -> AnnotationMeta:
 
     前提: df は同じ cfg で apply_filters 済みであること。件数・範囲は df 由来、
     filters_summary は cfg.analysis.filters 由来のため、両者が対応していないと
-    脚注の件数とフィルタ表示が食い違う（呼び出しは load_features→本関数の順で行う）。
+    脚注の件数とフィルタ表示が食い違う（呼び出しは load_real_panel→本関数の順で行う）。
     """
     n_rows = len(df)
     months = sorted(df["process_month"].dropna().unique().tolist()) if "process_month" in df.columns else []
