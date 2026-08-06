@@ -91,6 +91,25 @@ analysis:
   eda_cross_equipment_top_k: 3         # 設備間ヒートマップに採用する設備あたりの代表列数
   eda_cross_equipment_max_columns: 60  # 設備間ヒートマップの総列数上限（超過時は先頭のみ使用）
 
+  # 追加の EDA グラフ（既存の固定図に「追加」で出力される。空なら従来どおり固定図のみ）。
+  #   type: scatter | bar | histogram | box | heatmap
+  #   共通: title / output（reports/eda 配下のファイル名）/ filters（analysis.filters と同じ句）/ hue（色分け列）
+  #   scatter: x,y（数値）| bar: x（カテゴリ）,y（数値・省略で件数）,agg | histogram: x（数値）,bins,density
+  #   box: y（数値）,x（カテゴリ・任意）| heatmap: columns（数値列リスト）,method
+  #   設定ミス（列が無い・型違い・フィルタ後 0 行）はその図だけ WARN でスキップし処理は継続する。
+  #   例:
+  #     custom_charts:
+  #       - {type: scatter, x: EQ-01__pressure, y: EQ-01__stroke, hue: production_shift,
+  #          title: 圧入 圧力×ストローク, output: custom_pressure_stroke.png}
+  #       - {type: bar, x: 車種, y: has_repair_record, agg: mean,
+  #          filters: [{column: process_month, in: ["2026-07"]}]}
+  #       - {type: histogram, x: lead_time_sec, bins: 40, density: true, hue: has_repair_record}
+  #       - {type: box, x: production_shift, y: EQ-01__pressure}
+  #       - {type: heatmap, columns: [EQ-01__pressure, EQ-01__stroke, lead_time_sec], method: spearman}
+  custom_charts: []
+  custom_chart_max_hue: 8          # hue 水準数の上限（超過分は頻度上位のみ描画し WARN）
+  custom_chart_max_points: 20000   # scatter の最大描画点数（超過時は決定的サンプリング）
+
 # ---------------------------------------------------------------------
 # 実データ取り込み（docs/real_data_ingest_design.md）。CLI: convert / assemble
 # ---------------------------------------------------------------------

@@ -110,7 +110,8 @@ def _describe_clause(df: pd.DataFrame, clause: dict) -> str:
     return ", ".join(parts) if parts else str(clause)
 
 
-def _filters_summary(df: pd.DataFrame, rules: list[dict]) -> str:
+def filters_summary(df: pd.DataFrame, rules: list[dict]) -> str:
+    """フィルタ句リストを人間可読な文字列に整形する（脚注・ログ共通）。"""
     if not rules:
         return "なし"
     return " / ".join(_describe_clause(df, clause) for clause in rules)
@@ -175,12 +176,8 @@ def _apply_clause(df: pd.DataFrame, clause: dict, on_missing: str) -> pd.DataFra
     return out
 
 
-def apply_filters(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """analysis.filters をリスト順に AND 適用した DataFrame を返す。"""
-    rules = cfg.get("analysis.filters", []) or []
-    if not rules:
-        return df
-    on_missing = cfg.get("analysis.filters_on_missing_column", "warn")
+def apply_filter_clauses(df: pd.DataFrame, rules: list[dict], *, on_missing: str = "warn") -> pd.DataFrame:
+    """句リストを順に AND 適用した DataFrame を返す（0 行でも例外にしない）。"""
     if on_missing not in ("warn", "error"):
         logger.warning("[filter] filters_on_missing_column の不正値 '%s' を warn として扱います", on_missing)
         on_missing = "warn"
@@ -191,9 +188,19 @@ def apply_filters(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         filtered = _apply_clause(filtered, clause, on_missing)
     n_after = len(filtered)
     logger.info("フィルタ適用: %d -> %d 行（%d 句）", n_before, n_after, len(rules))
+    return filtered
 
-    if n_after == 0:
-        summary = _filters_summary(filtered, rules)
+
+def apply_filters(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """analysis.filters をリスト順に AND 適用した DataFrame を返す。"""
+    rules = cfg.get("analysis.filters", []) or []
+    if not rules:
+        return df
+    on_missing = cfg.get("analysis.filters_on_missing_column", "warn")
+    filtered = apply_filter_clauses(df, rules, on_missing=on_missing)
+
+    if len(filtered) == 0:
+        summary = filters_summary(filtered, rules)
         logger.warning("適用フィルタが全行を除外しました: %s", summary)
         raise ValueError(f"適用フィルタが全行を除外しました: {summary}")
     return filtered
@@ -229,9 +236,9 @@ def build_annotation_meta(df: pd.DataFrame, cfg: Config) -> AnnotationMeta:
     month_max = str(months[-1]) if months else None
     n_months = len(months)
     rules = cfg.get("analysis.filters", []) or []
-    filters_summary = _filters_summary(df, rules)
+    summary_text = filters_summary(df, rules)
     return AnnotationMeta(
-        n_rows=n_rows, month_min=month_min, month_max=month_max, n_months=n_months, filters_summary=filters_summary
+        n_rows=n_rows, month_min=month_min, month_max=month_max, n_months=n_months, filters_summary=summary_text
     )
 
 

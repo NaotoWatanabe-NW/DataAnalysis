@@ -11,6 +11,7 @@ traceability 測定値の分布・相関は `{設備}__{measure}` 列から動�
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from pathlib import Path
 
@@ -21,9 +22,11 @@ import pandas as pd
 from . import viz_style as vs
 from .analysis_data import (
     AnnotationMeta,
+    apply_filter_clauses,
     build_annotation_meta,
     derive_production_date,
     equipment_measure_groups,
+    filters_summary,
     get_targets,
     load_real_panel,
     resolve_predictors,
@@ -229,8 +232,10 @@ def _fig_corr_with_target(
     return _save(fig, out, footnote)
 
 
-def _draw_corr_heatmap(df: pd.DataFrame, cols: list[str], title: str, *, figsize_base: float = 0.42) -> plt.Figure:
-    corr = df[cols].corr(numeric_only=True)
+def _draw_corr_heatmap(
+    df: pd.DataFrame, cols: list[str], title: str, *, figsize_base: float = 0.42, method: str = "pearson"
+) -> plt.Figure:
+    corr = df[cols].corr(method=method, numeric_only=True)
     side = max(8.5, figsize_base * len(cols) + 2)
     fig, ax = plt.subplots(figsize=(side, side * 0.86))
     im = ax.imshow(corr.values, cmap=vs.diverging_cmap(), vmin=-1, vmax=1)
@@ -399,6 +404,403 @@ def _cap_group_columns(
     return capped
 
 
+_CUSTOM_REQUIRED_FIELDS = {
+    "scatter": ["x", "y"],
+    "bar": ["x"],
+    "histogram": ["x"],
+    "box": ["y"],
+    "heatmap": ["columns"],
+}
+
+
+def _custom_chart_columns(chart_type: str, spec: dict) -> list[str]:
+    """列存在チェック対象の列名一覧を返す（heatmap の hue は非対応のため含めない）。"""
+    cols: list[str] = []
+    if chart_type == "heatmap":
+        cols.extend(spec.get("columns") or [])
+        return cols
+    for field in ("x", "y"):
+        v = spec.get(field)
+        if v:
+            cols.append(v)
+    hue = spec.get("hue")
+    if hue:
+        cols.append(hue)
+    return cols
+
+
+def _validate_custom_spec(df: pd.DataFrame, spec: dict, chart_type: str) -> str | None:
+    """設定ミスがあればエラーメッセージを返す（無ければ None）。df 自体は変更しない。"""
+    required = _CUSTOM_REQUIRED_FIELDS[chart_type]
+    missing_fields = [f for f in required if not spec.get(f)]
+    if missing_fields:
+        return f"必須フィールドが不足しています: {missing_fields}"
+
+    if chart_type == "heatmap":
+        cols = spec.get("columns")
+        if not isinstance(cols, list) or len(cols) < 2:
+            return f"heatmap の columns はリスト(2列以上)で指定してください: {cols!r}"
+
+    columns = _custom_chart_columns(chart_type, spec)
+    missing_cols = [c for c in columns if c not in df.columns]
+    if missing_cols:
+        return f"指定された列が存在しません: {missing_cols}"
+
+    if chart_type == "heatmap":
+        numeric_cols = [c for c in spec["columns"] if pd.api.types.is_numeric_dtype(df[c])]
+        if len(numeric_cols) < 2:
+            return f"heatmap は数値列が2本以上必要です（数値列: {numeric_cols}）"
+        return None
+
+    numeric_fields = {
+        "scatter": ["x", "y"],
+        "bar": ["y"] if spec.get("y") else [],
+        "histogram": ["x"],
+        "box": ["y"],
+    }[chart_type]
+    non_numeric = {f: spec[f] for f in numeric_fields if not pd.api.types.is_numeric_dtype(df[spec[f]])}
+    if non_numeric:
+        return f"数値であるべき列が数値ではありません: {non_numeric}"
+
+    return None
+
+
+def _auto_custom_title(chart_type: str, spec: dict) -> str:
+    x, y, hue = spec.get("x"), spec.get("y"), spec.get("hue")
+    if chart_type == "scatter":
+        title = f"{y} と {x} の関係"
+        return title + (f"（{hue} 別）" if hue else "")
+    if chart_type == "bar":
+        if y:
+            return f"{x} 別 {y}（{spec.get('agg', 'mean')}）"
+        return f"{x} 別 件数"
+    if chart_type == "histogram":
+        title = f"{x} の分布"
+        return title + (f"（{hue} 別）" if hue else "")
+    if chart_type == "box":
+        return f"{x} 別 {y} の分布" if x else f"{y} の分布"
+    if chart_type == "heatmap":
+        cols = spec.get("columns") or []
+        return f"相関ヒートマップ（{len(cols)}列・{spec.get('method', 'pearson')}）"
+    return chart_type
+
+
+def _custom_chart_filename(spec: dict, index: int, chart_type: str) -> str:
+    output = spec.get("output")
+    if not output:
+        return f"custom_{index:02d}_{chart_type}.png"
+    name = Path(output).name
+    if not name:
+        return f"custom_{index:02d}_{chart_type}.png"
+    if not Path(name).suffix:
+        name = f"{name}.png"
+    if name != output:
+        logger.warning(
+            "[custom_charts/%d %s] output はファイル名のみ指定できます。%r -> %r に丸めます",
+            index, chart_type, output, name,
+        )
+    return name
+
+
+def _cap_hue_levels(sub: pd.DataFrame, hue: str, cfg: Config, tag: str) -> list[str]:
+    """hue 水準を頻度降順で並べ、上限（analysis.custom_chart_max_hue）超過分を切り捨てる。"""
+    max_hue = int(cfg.get("analysis.custom_chart_max_hue", 8))
+    levels = [str(v) for v in sub[hue].dropna().astype(str).value_counts().index]
+    if len(levels) > max_hue:
+        logger.warning(
+            "%s hue(%s) の水準数 %d が上限 %d を超えたため、頻度上位 %d 水準のみ描画します。",
+            tag, hue, len(levels), max_hue, max_hue,
+        )
+        levels = levels[:max_hue]
+    return levels
+
+
+def _cap_categories(sub: pd.DataFrame, col: str, cfg: Config, tag: str) -> list[str]:
+    """カテゴリ水準を頻度降順で並べ、上限（analysis.eda_max_categories）超過分を切り捨てる。"""
+    max_n = int(cfg.get("analysis.eda_max_categories", 15))
+    levels = [str(v) for v in sub[col].dropna().astype(str).value_counts().index]
+    if len(levels) > max_n:
+        logger.warning(
+            "%s %s のカテゴリ数 %d が上限 %d を超えたため、頻度上位 %d カテゴリのみ描画します。",
+            tag, col, len(levels), max_n, max_n,
+        )
+        levels = levels[:max_n]
+    return levels
+
+
+def _custom_scatter(sub: pd.DataFrame, spec: dict, cfg: Config, tag: str) -> tuple[plt.Figure, str]:
+    x, y, hue = spec["x"], spec["y"], spec.get("hue")
+    alpha = float(spec.get("alpha", 0.5))
+
+    data = sub.dropna(subset=[x, y])
+    if data.empty:
+        raise ValueError(f"scatter: {x}/{y} が全て欠損です")
+
+    max_points = int(cfg.get("analysis.custom_chart_max_points", 20000))
+    n_total = len(data)
+    extra = ""
+    if n_total > max_points:
+        seed = int(cfg.get("project.random_seed", 0))
+        data = data.sample(n=max_points, random_state=seed)
+        extra = f"（サンプリング {max_points}/{n_total} 点）"
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    if hue:
+        levels = _cap_hue_levels(data, hue, cfg, tag)
+        for i, level in enumerate(levels):
+            sub_h = data[data[hue].astype(str) == level]
+            ax.scatter(sub_h[x], sub_h[y], color=vs.color_for(i), alpha=alpha, zorder=3, label=level)
+        ax.legend(fontsize=8, title=hue)
+    else:
+        ax.scatter(data[x], data[y], color=vs.CATEGORICAL[0], alpha=alpha, zorder=3)
+    ax.set_title(spec["title"])
+    ax.set_xlabel(x)
+    ax.set_ylabel(y)
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    return fig, extra
+
+
+def _custom_bar(sub: pd.DataFrame, spec: dict, cfg: Config, tag: str) -> tuple[plt.Figure, str]:
+    x, y, hue = spec["x"], spec.get("y"), spec.get("hue")
+    agg = spec.get("agg", "mean")
+    if not y and "agg" in spec:
+        logger.warning("%s y が無いため agg(%s) は無視し件数を集計します", tag, agg)
+    if y and agg not in ("mean", "sum", "median", "count"):
+        raise ValueError(f"bar: 未対応の agg です: {agg}")
+
+    x_levels = _cap_categories(sub, x, cfg, tag)
+    data = sub[sub[x].astype(str).isin(x_levels)].copy()
+    data[x] = data[x].astype(str)
+    if data.empty:
+        raise ValueError(f"bar: {x} が全て欠損です")
+
+    fig, ax = plt.subplots(figsize=(min(18, 6 + 0.5 * len(x_levels)), 6))
+    idx = np.arange(len(x_levels))
+
+    if hue:
+        levels = _cap_hue_levels(data, hue, cfg, tag)
+        n_h = len(levels)
+        w = 0.8 / max(n_h, 1)
+        for i, level in enumerate(levels):
+            data_h = data[data[hue].astype(str) == level]
+            if y:
+                values = data_h.groupby(x)[y].agg(agg).reindex(x_levels)
+            else:
+                values = data_h.groupby(x).size().reindex(x_levels).fillna(0)
+            ax.bar(idx + (i - (n_h - 1) / 2) * w, values.values, width=w, color=vs.color_for(i), zorder=3, label=level)
+        ax.set_xticks(idx, x_levels, rotation=30)
+        ax.legend(fontsize=8, title=hue)
+    else:
+        if y:
+            values = data.groupby(x)[y].agg(agg).reindex(x_levels)
+        else:
+            values = data.groupby(x).size().reindex(x_levels).fillna(0)
+        ax.bar(idx, values.values, width=0.62, color=vs.CATEGORICAL[0], zorder=3)
+        ax.set_xticks(idx, x_levels, rotation=30)
+        for i, v in enumerate(values.values):
+            label = f"{v:.2f}" if y else f"{int(v)}"
+            ax.text(i, v, label, ha="center", va="bottom", fontsize=9, color=vs.INK_SECONDARY)
+
+    ax.set_title(spec["title"])
+    ax.set_xlabel(x)
+    ax.set_ylabel(y if y else "件数")
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    return fig, ""
+
+
+def _custom_histogram(sub: pd.DataFrame, spec: dict, cfg: Config, tag: str) -> tuple[plt.Figure, str]:
+    x, hue = spec["x"], spec.get("hue")
+    bins = int(spec.get("bins", 30))
+    density = bool(spec.get("density", False))
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    if hue:
+        levels = _cap_hue_levels(sub.dropna(subset=[x]), hue, cfg, tag)
+        drawn = False
+        for i, level in enumerate(levels):
+            values = sub.loc[sub[hue].astype(str) == level, x].dropna()
+            if values.empty:
+                continue
+            ax.hist(
+                values, bins=bins, density=density, alpha=0.55, color=vs.color_for(i),
+                edgecolor=vs.color_for(i), linewidth=1.0, zorder=3, label=f"{level}（n={len(values)}）",
+            )
+            drawn = True
+        if not drawn:
+            raise ValueError(f"histogram: {x} が全て欠損です")
+        ax.legend(fontsize=8, title=hue)
+    else:
+        values = sub[x].dropna()
+        if values.empty:
+            raise ValueError(f"histogram: {x} が全て欠損です")
+        ax.hist(values, bins=bins, density=density, color=vs.CATEGORICAL[0], edgecolor=vs.CATEGORICAL[0],
+                 linewidth=1.0, zorder=3)
+    ax.set_title(spec["title"])
+    ax.set_xlabel(x)
+    ax.set_ylabel("密度" if density else "度数")
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    return fig, ""
+
+
+def _custom_box(sub: pd.DataFrame, spec: dict, cfg: Config, tag: str) -> tuple[plt.Figure, str]:
+    y, x, hue = spec["y"], spec.get("x"), spec.get("hue")
+
+    if x:
+        x_levels = _cap_categories(sub, x, cfg, tag)
+        data = sub[sub[x].astype(str).isin(x_levels)].copy()
+        data[x] = data[x].astype(str)
+    else:
+        x_levels = None
+        data = sub
+
+    data = data.dropna(subset=[y])
+    if data.empty:
+        raise ValueError(f"box: {y} が全て欠損です")
+
+    width = min(18, 6 + 0.5 * (len(x_levels) if x_levels else 1))
+    fig, ax = plt.subplots(figsize=(width, 6))
+
+    if x is None:
+        if hue:
+            levels = _cap_hue_levels(data, hue, cfg, tag)
+            n_h = len(levels)
+            w = 0.8 / max(n_h, 1)
+            positions = [(i - (n_h - 1) / 2) * w for i in range(n_h)]
+            groups = [data.loc[data[hue].astype(str) == level, y].values for level in levels]
+            bp = ax.boxplot(groups, positions=positions, widths=w * 0.9, patch_artist=True, showfliers=False)
+            for i, patch in enumerate(bp["boxes"]):
+                patch.set_facecolor(vs.color_for(i))
+                patch.set_alpha(0.75)
+            ax.set_xticks(positions, levels)
+            handles = [plt.Rectangle((0, 0), 1, 1, color=vs.color_for(i)) for i in range(n_h)]
+            ax.legend(handles, levels, fontsize=8, title=hue)
+        else:
+            bp = ax.boxplot([data[y].values], tick_labels=[y], patch_artist=True, showfliers=False)
+            for patch in bp["boxes"]:
+                patch.set_facecolor(vs.CATEGORICAL[0])
+                patch.set_alpha(0.75)
+    else:
+        idx = np.arange(len(x_levels))
+        if hue:
+            levels = _cap_hue_levels(data, hue, cfg, tag)
+            n_h = len(levels)
+            w = 0.8 / max(n_h, 1)
+            for i, level in enumerate(levels):
+                positions = idx + (i - (n_h - 1) / 2) * w
+                groups = [
+                    data.loc[(data[x] == cat) & (data[hue].astype(str) == level), y].values for cat in x_levels
+                ]
+                bp = ax.boxplot(groups, positions=positions, widths=w * 0.9, patch_artist=True, showfliers=False)
+                for patch in bp["boxes"]:
+                    patch.set_facecolor(vs.color_for(i))
+                    patch.set_alpha(0.75)
+            ax.set_xticks(idx, x_levels, rotation=30)
+            handles = [plt.Rectangle((0, 0), 1, 1, color=vs.color_for(i)) for i in range(n_h)]
+            ax.legend(handles, levels, fontsize=8, title=hue)
+        else:
+            groups = [data.loc[data[x] == cat, y].values for cat in x_levels]
+            bp = ax.boxplot(groups, tick_labels=x_levels, patch_artist=True, showfliers=False)
+            for patch in bp["boxes"]:
+                patch.set_facecolor(vs.CATEGORICAL[0])
+                patch.set_alpha(0.75)
+            ax.tick_params(axis="x", rotation=30)
+
+    ax.set_title(spec["title"])
+    ax.set_ylabel(y)
+    if x:
+        ax.set_xlabel(x)
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    return fig, ""
+
+
+def _custom_heatmap(sub: pd.DataFrame, spec: dict, cfg: Config, tag: str) -> tuple[plt.Figure, str]:
+    method = spec.get("method", "pearson")
+    if method not in ("pearson", "spearman"):
+        raise ValueError(f"heatmap: 未対応の method です: {method}")
+    if spec.get("hue"):
+        logger.warning("%s heatmap は hue に非対応のため無視します: %s", tag, spec.get("hue"))
+    cols = [c for c in spec["columns"] if pd.api.types.is_numeric_dtype(sub[c])]
+    if len(cols) < 2:
+        raise ValueError(f"heatmap: 数値列が2本未満です: {cols}")
+    fig = _draw_corr_heatmap(sub, cols, spec["title"], method=method)
+    return fig, ""
+
+
+_CUSTOM_BUILDERS = {
+    "scatter": _custom_scatter,
+    "bar": _custom_bar,
+    "histogram": _custom_histogram,
+    "box": _custom_box,
+    "heatmap": _custom_heatmap,
+}
+
+
+def _render_one_custom_chart(
+    df: pd.DataFrame, spec: dict, index: int, cfg: Config, out_dir: Path, meta: AnnotationMeta,
+) -> str | None:
+    chart_type = spec.get("type")
+    tag = f"[custom_charts/{index} {chart_type}]"
+    builder = _CUSTOM_BUILDERS.get(chart_type)
+    if builder is None:
+        logger.warning("%s type が未知/未指定です: %r", tag, chart_type)
+        return None
+
+    error = _validate_custom_spec(df, spec, chart_type)
+    if error:
+        logger.warning("%s %s", tag, error)
+        return None
+
+    chart_rules = spec.get("filters", []) or []
+    on_missing = cfg.get("analysis.filters_on_missing_column", "warn")
+    sub = apply_filter_clauses(df, chart_rules, on_missing=on_missing)
+    if len(sub) == 0:
+        logger.warning("%s フィルタ適用後に 0 行のためスキップします", tag)
+        return None
+
+    render_spec = dict(spec)
+    render_spec["title"] = spec.get("title") or _auto_custom_title(chart_type, spec)
+
+    fig, extra_data_kind = builder(sub, render_spec, cfg, tag)
+
+    filename = _custom_chart_filename(spec, index, chart_type)
+    if chart_rules:
+        combined_summary = f"{meta.filters_summary} ＋ 図単位: {filters_summary(sub, chart_rules)}"
+    else:
+        combined_summary = meta.filters_summary
+    chart_meta = dataclasses.replace(meta, n_rows=len(sub), filters_summary=combined_summary)
+    footnote = chart_meta.footnote(data_kind=f"カスタム図/{chart_type}{extra_data_kind}")
+    return _save(fig, out_dir / filename, footnote)
+
+
+def _render_custom_charts(df: pd.DataFrame, cfg: Config, out_dir: Path, meta: AnnotationMeta) -> list[str]:
+    """analysis.custom_charts で宣言された追加 EDA 図を描画する（既存の固定図は変更しない）。"""
+    specs = cfg.get("analysis.custom_charts", []) or []
+    if not specs:
+        return []
+
+    figures: list[str] = []
+    n_skipped = 0
+    for index, spec in enumerate(specs, start=1):
+        path = None
+        try:
+            if not isinstance(spec, dict):
+                logger.warning("[custom_charts/%d] 設定が dict ではないためスキップします: %r", index, spec)
+            else:
+                path = _render_one_custom_chart(df, spec, index, cfg, out_dir, meta)
+        except Exception:
+            chart_type = spec.get("type") if isinstance(spec, dict) else None
+            logger.warning(
+                "[custom_charts/%d %s] 描画に失敗したためスキップします", index, chart_type, exc_info=True,
+            )
+            path = None
+        if path:
+            figures.append(path)
+        else:
+            n_skipped += 1
+    logger.info("カスタム図: %d/%d 枚を出力（スキップ %d）", len(figures), len(specs), n_skipped)
+    return figures
+
+
 def run_eda(cfg: Config) -> dict:
     """実データパネルから EDA 図一式を生成して保存する。"""
     vs.apply_style()
@@ -447,6 +849,8 @@ def run_eda(cfg: Config) -> dict:
     fig = _fig_defect_category_breakdown(df, out_dir / "07_defect_category_breakdown.png", meta)
     if fig:
         figures.append(fig)
+
+    figures += _render_custom_charts(df, cfg, out_dir, meta)
 
     logger.info("EDA 完了: %d 図を %s に出力", len(figures), out_dir)
     return {"n_figures": len(figures), "output_dir": str(out_dir), "figures": figures}

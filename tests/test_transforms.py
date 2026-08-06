@@ -20,8 +20,8 @@ sys.path.insert(0, str(_ROOT / "src"))
 from defect_analysis.config import Config  # noqa: E402
 from defect_analysis.io_utils import load_df, resolve_format, save_df  # noqa: E402
 from defect_analysis.category_integrate import (  # noqa: E402
-    integrate_categories,
-    load_spec,
+    apply_category_mapping,
+    load_mapping,
     run_category_integration,
 )
 from defect_analysis.schema_catalog import (  # noqa: E402
@@ -126,70 +126,158 @@ class SchemaCatalogTest(unittest.TestCase):
 
 
 class CategoryIntegrateTest(unittest.TestCase):
-    def _spec(self) -> dict:
-        return {
-            "source_columns": {"major": "大", "middle": "中", "minor": "小"},
-            "output_column": "統合",
-            "rules": [
-                {"when": {"middle": ["締結"]}, "to": "締結不良"},
-                {"when": {"major": ["外観"]}, "to": "外観系"},
-            ],
-            "default": {"method": "concat", "levels": ["major", "middle"], "separator": "＞"},
-            "warn_unmatched": False,
-        }
+    """docs/category_csv_and_custom_charts_design.md T4 のテストケース群。"""
 
-    def _df(self) -> pd.DataFrame:
-        return pd.DataFrame(
-            {
-                "大": ["機能", "外観", "寸法"],
-                "中": ["締結", "塗装", "切削"],
-                "小": ["ボルト緩み", "色差", "面粗さ"],
-            }
+    def _write_map(self, path: Path, text: str) -> None:
+        path.write_text(text, encoding="utf-8")
+
+    def _default_map_text(self) -> str:
+        return (
+            "# コメント行\n"
+            "value,category\n"
+            "締結,締結不良\n"
+            "溶接,機能系\n"
         )
 
-    def test_rules_priority_and_default_concat(self):
-        out = integrate_categories(self._df(), self._spec())
-        self.assertEqual(out.iloc[0], "締結不良")     # middle=締結 が最優先で一致
-        self.assertEqual(out.iloc[1], "外観系")       # major=外観 で一致
-        self.assertEqual(out.iloc[2], "寸法＞切削")   # 未一致 -> default concat
-
-    def test_first_matching_rule_wins(self):
-        # major=外観 かつ middle=締結 の行は、先に評価される締結ルールが勝つ
-        df = pd.DataFrame({"大": ["外観"], "中": ["締結"], "小": ["x"]})
-        out = integrate_categories(df, self._spec())
-        self.assertEqual(out.iloc[0], "締結不良")
-
-    def test_missing_source_column_raises(self):
-        df = pd.DataFrame({"大": ["機能"]})  # 中/小 が無い
-        with self.assertRaises(KeyError):
-            integrate_categories(df, self._spec())
-
-    def test_load_spec_requires_section(self):
+    def test_load_mapping_reads_value_category_pairs(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "bad.yaml"
-            path.write_text("foo: bar\n", encoding="utf-8")
+            path = Path(tmp) / "map.csv"
+            self._write_map(path, self._default_map_text())
+            mapping = load_mapping(path)
+            self.assertEqual(mapping, {"締結": "締結不良", "溶接": "機能系"})
+
+    def test_load_mapping_ignores_comment_lines_and_blank_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "map.csv"
+            self._write_map(
+                path,
+                "# 見出しコメント\nvalue,category\n\n締結,締結不良\n# 途中のコメント\n\n溶接,機能系\n",
+            )
+            mapping = load_mapping(path)
+            self.assertEqual(mapping, {"締結": "締結不良", "溶接": "機能系"})
+
+    def test_load_mapping_raises_when_header_is_not_value_category(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "map.csv"
+            self._write_map(path, "大分類,統合カテゴリ\n締結,締結不良\n")
             with self.assertRaises(ValueError):
-                load_spec(path)
+                load_mapping(path)
 
-    def test_run_end_to_end_writes_output_with_new_column(self):
-        import yaml
+    def test_load_mapping_raises_when_value_is_duplicated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "map.csv"
+            self._write_map(path, "value,category\n締結,締結不良\n締結,別カテゴリ\n")
+            with self.assertRaises(ValueError):
+                load_mapping(path)
 
+    def test_load_mapping_raises_when_category_cell_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "map.csv"
+            self._write_map(path, "value,category\n締結,\n")
+            with self.assertRaises(ValueError):
+                load_mapping(path)
+
+    def test_load_mapping_raises_when_file_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "does_not_exist.csv"
+            with self.assertRaises(FileNotFoundError):
+                load_mapping(path)
+
+    def test_apply_mapping_converts_known_values(self):
+        values = pd.Series(["締結", "溶接"])
+        mapping = {"締結": "締結不良", "溶接": "機能系"}
+        result, unmatched = apply_category_mapping(values, mapping)
+        self.assertEqual(result.tolist(), ["締結不良", "機能系"])
+        self.assertEqual(unmatched, {})
+
+    def test_apply_mapping_keeps_original_value_when_not_in_table(self):
+        values = pd.Series(["締結", "その他"])
+        mapping = {"締結": "締結不良"}
+        result, _ = apply_category_mapping(values, mapping)
+        self.assertEqual(result.tolist(), ["締結不良", "その他"])
+
+    def test_apply_mapping_reports_unmatched_values_with_counts(self):
+        values = pd.Series(["その他", "未知", "その他"])
+        mapping = {"締結": "締結不良"}
+        _, unmatched = apply_category_mapping(values, mapping)
+        self.assertEqual(unmatched, {"その他": 2, "未知": 1})
+
+    def test_apply_mapping_keeps_null_as_null(self):
+        values = pd.Series(["締結", None, "その他"])
+        mapping = {"締結": "締結不良"}
+        result, unmatched = apply_category_mapping(values, mapping)
+        self.assertTrue(pd.isna(result.iloc[1]))
+        self.assertNotIn("nan", unmatched)
+        self.assertEqual(unmatched, {"その他": 1})
+
+    def test_apply_mapping_strips_surrounding_whitespace_before_lookup(self):
+        values = pd.Series([" 締結 ", "\t溶接\n"])
+        mapping = {"締結": "締結不良", "溶接": "機能系"}
+        result, unmatched = apply_category_mapping(values, mapping)
+        self.assertEqual(result.tolist(), ["締結不良", "機能系"])
+        self.assertEqual(unmatched, {})
+
+    def test_run_writes_output_csv_with_specified_output_column(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             cfg = Config({}, root=root)
-            map_path = root / "map.yaml"
-            map_path.write_text(
-                yaml.safe_dump({"category_integration": self._spec()}, allow_unicode=True), encoding="utf-8"
-            )
+            map_path = root / "map.csv"
+            self._write_map(map_path, self._default_map_text())
             in_path = root / "in.csv"
-            self._df().to_csv(in_path, index=False)
+            pd.DataFrame({"中カテゴリ": ["締結", "溶接"]}).to_csv(in_path, index=False)
             out_path = root / "out.csv"
 
-            result = run_category_integration(cfg, str(in_path), str(out_path), map_path=str(map_path))
-            self.assertEqual(result["n_rows"], 3)
+            result = run_category_integration(
+                cfg,
+                str(in_path),
+                str(out_path),
+                source_column="中カテゴリ",
+                output_column="統合",
+                map_path=str(map_path),
+            )
+            self.assertEqual(result["n_rows"], 2)
             written = pd.read_csv(out_path)
             self.assertIn("統合", written.columns)
             self.assertEqual(written.loc[0, "統合"], "締結不良")
+
+    def test_run_raises_when_source_column_is_missing_from_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = Config({}, root=root)
+            map_path = root / "map.csv"
+            self._write_map(map_path, self._default_map_text())
+            in_path = root / "in.csv"
+            pd.DataFrame({"大カテゴリ": ["機能"]}).to_csv(in_path, index=False)
+            out_path = root / "out.csv"
+
+            with self.assertRaises(KeyError):
+                run_category_integration(
+                    cfg,
+                    str(in_path),
+                    str(out_path),
+                    source_column="中カテゴリ",
+                    map_path=str(map_path),
+                )
+
+    def test_run_returns_unmatched_summary_when_table_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = Config({}, root=root)
+            map_path = root / "map.csv"
+            self._write_map(map_path, self._default_map_text())
+            in_path = root / "in.csv"
+            pd.DataFrame({"中カテゴリ": ["締結", "その他"]}).to_csv(in_path, index=False)
+            out_path = root / "out.csv"
+
+            result = run_category_integration(
+                cfg,
+                str(in_path),
+                str(out_path),
+                source_column="中カテゴリ",
+                map_path=str(map_path),
+            )
+            self.assertEqual(result["n_unmatched"], 1)
+            self.assertEqual(result["unmatched_values"], {"その他": 1})
 
 
 class AnalysisDataTest(unittest.TestCase):

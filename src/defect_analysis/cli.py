@@ -7,8 +7,9 @@
 ユーティリティ:
     python main.py catalog             # CSVの各列名・型・元ファイル名等を YAML に記録
     python main.py category --input data/sample/defect_categories.csv \
-                            --output reports/category_integrated.csv
-                                       # 大/中/小カテゴリから統合カテゴリを生成
+                            --output reports/category_integrated.csv \
+                            --source-column 中カテゴリ
+                                       # カテゴリ列から統合カテゴリを生成（CSVマッピング表を適用）
 
 共通オプション: --config, --log-level（各サブコマンドの後ろに付与可）
 """
@@ -40,10 +41,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_catalog.add_argument("--input", default=None, help="対象glob/ディレクトリ/ファイル（既定: catalog.input_glob）")
     p_catalog.add_argument("--output", default=None, help="出力YAMLパス（既定: catalog.output_path）")
 
-    p_category = sub.add_parser("category", parents=[common], help="大/中/小カテゴリから統合カテゴリを生成")
-    p_category.add_argument("--input", required=True, help="入力CSV（大/中/小カテゴリ列を含む）")
+    p_category = sub.add_parser("category", parents=[common], help="カテゴリ列から統合カテゴリを生成")
+    p_category.add_argument("--input", required=True, help="入力CSV（写像元のカテゴリ列を含む）")
     p_category.add_argument("--output", required=True, help="統合カテゴリ列を付与した出力CSV")
-    p_category.add_argument("--map", default=None, help="変換設定yaml（既定: config/category_map.yaml）")
+    p_category.add_argument("--source-column", required=True, help="写像元の列名（例: 中カテゴリ）")
+    p_category.add_argument("--output-column", default="統合カテゴリ", help="生成する列名（既定: 統合カテゴリ）")
+    p_category.add_argument("--map", default=None, help="変換表CSV（既定: config/category_map.csv）")
 
     # 実データ経路（docs/real_data_ingest_design.md）: raw CSV -> lake -> vin_panel
     p_convert = sub.add_parser("convert", parents=[common], help="実データ: raw CSV を data/lake/ の Parquet に変換")
@@ -73,7 +76,14 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "category":
         from .category_integrate import run_category_integration
 
-        run_category_integration(cfg, input_path=args.input, output_path=args.output, map_path=args.map)
+        run_category_integration(
+            cfg,
+            input_path=args.input,
+            output_path=args.output,
+            source_column=args.source_column,
+            output_column=args.output_column,
+            map_path=args.map,
+        )
     elif args.command == "eda":
         from .eda import run_eda
 

@@ -186,6 +186,27 @@ class RepairEncodingAndAliasTest(unittest.TestCase):
 
         self.assertEqual(sources[0].time_column, "別時刻")
 
+    def test_monthly_split_repair_files_are_grouped_into_one_source(self):
+        # data/raw/repair/defect_{YYYYMM}.csv のように月単位でファイルを分けても、
+        # source_key() の日付サフィックス除去（6桁連続数字）により両方が defect に正規化され、
+        # source_aliases の既定 repair/defect: 修正 が当たって1つの RawSource にまとまる。
+        sub = self.raw_dir / "repair"
+        for name in ["defect_202607.csv", "defect_202608.csv"]:
+            _write_csv_cp932(sub / name, ["VIN", "PB-ON"], ["'HE93S-122065", "20260724 100000"])
+        cfg = Config({}, root=self.root)
+
+        sources = discover_sources(self.raw_dir, cfg)
+
+        self.assertEqual(len(sources), 1)
+        source = sources[0]
+        self.assertEqual(source.name, "修正")
+        self.assertEqual(source.kind, "repair")
+        self.assertEqual(len(source.files), 2)
+        self.assertEqual(
+            sorted(f.name for f in source.files),
+            sorted(["defect_202607.csv", "defect_202608.csv"]),
+        )
+
     def test_by_kind_time_column_missing_from_header_skips_source_with_error_log(self):
         sub = self.raw_dir / "traceability"
         _write_csv_cp932(sub / "何か.csv", ["VIN#", "通過日時"], ["A", "2026/07/24 10:00:00"])

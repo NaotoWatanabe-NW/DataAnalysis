@@ -771,11 +771,11 @@ data/raw/repair/{既存の命名（例: defect.csv）}   ※ 日次で洗い替�
 
 ### 注意点（repair のみ別扱いが必要）
 
-repair（`data/raw/repair/defect.csv`）は現在**単一ファイル・日付サフィックス無し**で提供されており、
-`real_ingest.source_aliases` の既定 `repair/defect: 修正` はこの命名を前提にしている
-（[docs/real_data_repair_design.md](real_data_repair_design.md) §8-7 参照）。
-repair も日次ファイルに切り替える場合は、ファイル名が変わることで
-`source_aliases` の対象外になり、ソース名が変わってレイクのディレクトリが分かれてしまう。
-**repair を日次化する場合は、その時点で `source_aliases` の設定を追記する運用とする**
-（設計変更は不要、config 追記のみ）。単一ファイルを洗い替え運用する場合は、増分変換の効果が
-薄れる点（上記2と同じ理由）に注意されたい。
+repair は当初 `data/raw/repair/defect.csv`（単一ファイル・日付サフィックス無し）で提供されていたが、
+【確定・2026-08-06】`data/raw/repair/defect_202607.csv` / `defect_202608.csv` のように月単位で
+分割して置く運用でも**コード変更なしで動作することを確認済み**。`naming.source_key()` の
+`_DATE_SUFFIX_RE` は末尾の6桁連続数字（`_202607` 等）の日付サフィックスを正しく除去するため、
+月次分割ファイルはすべて `source_key` = `defect` に正規化され、
+`real_ingest.source_aliases` の既定 `repair/defect: 修正`（[docs/real_data_repair_design.md](real_data_repair_design.md) §8-7 参照）が
+そのまま当たって同一 `RawSource` にまとまる。alias の追記は不要（`tests/test_raw_sources.py` で固定化済み）。
+単一ファイルを洗い替え運用する場合は、増分変換の効果が薄れる点（上記2と同じ理由）に注意されたい。

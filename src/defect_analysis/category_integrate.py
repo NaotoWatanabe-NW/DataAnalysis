@@ -1,7 +1,8 @@
-"""大/中/小カテゴリから統合カテゴリを生成するユーティリティ。
+"""カテゴリ列から統合カテゴリを生成するユーティリティ。
 
-変換ルールは設定ファイル（既定 config/category_map.yaml）で定義する。
-rules を上から順に評価し最初に一致した割当を採用、未一致は default で生成する。
+変換ルールは CSV の1対1マッピング表（既定 config/category_map.csv、`value,category` の2列）で
+定義する。表に無い値は元の値をそのまま通し、WARNING で未一致の値と件数を報告する
+（データを失わないことを優先する。docs/category_csv_and_custom_charts_design.md 参照）。
 """
 
 from __future__ import annotations
@@ -10,84 +11,65 @@ import logging
 from pathlib import Path
 
 import pandas as pd
-import yaml
 
 from .config import Config
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MAP_REL = Path("config") / "category_map.yaml"
+DEFAULT_MAP_REL = Path("config") / "category_map.csv"
+DEFAULT_OUTPUT_COLUMN = "統合カテゴリ"
 
 
-def load_spec(path: Path) -> dict:
-    """変換設定ファイルを読み、category_integration セクションを返す。"""
+def load_mapping(path: Path) -> dict[str, str]:
+    """マッピング CSV を読み {value: category} を返す。検証エラーは ValueError。"""
     if not path.exists():
-        raise FileNotFoundError(f"カテゴリ変換設定が見つかりません: {path}")
-    with path.open(encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    spec = data.get("category_integration")
-    if not spec:
-        raise ValueError(f"設定に category_integration セクションがありません: {path}")
-    if "source_columns" not in spec:
-        raise ValueError("category_integration.source_columns が必要です")
-    return spec
+        raise FileNotFoundError(f"カテゴリ変換表が見つかりません: {path}")
+
+    df = pd.read_csv(path, dtype=str, encoding="utf-8-sig", comment="#", keep_default_na=False)
+
+    if list(df.columns) != ["value", "category"]:
+        raise ValueError(
+            f"カテゴリ変換表のヘッダは value,category である必要があります: {path} "
+            f"(実際: {list(df.columns)})"
+        )
+
+    empty_mask = (df["value"] == "") | (df["category"] == "")
+    if empty_mask.any():
+        n_bad = int(empty_mask.sum())
+        raise ValueError(f"カテゴリ変換表に空セルがある行が {n_bad} 件あります: {path}")
+
+    dup = df["value"][df["value"].duplicated()].unique().tolist()
+    if dup:
+        raise ValueError(f"カテゴリ変換表の value が重複しています: {sorted(dup)}: {path}")
+
+    return dict(zip(df["value"], df["category"]))
 
 
-def _apply_default(df: pd.DataFrame, src: dict, default: dict) -> pd.Series | str:
-    method = default.get("method", "middle")
-    if method == "const":
-        return default.get("value", "未分類")
-    if method in ("major", "middle", "minor"):
-        col = src[method]
-        return df[col].astype(str)
-    if method == "concat":
-        levels = default.get("levels", ["major", "middle"])
-        sep = str(default.get("separator", "_"))
-        cols = [src[lv] for lv in levels if lv in src]
-        return df[cols].astype(str).agg(sep.join, axis=1)
-    raise ValueError(f"未対応の default.method: {method!r}")
+def apply_category_mapping(
+    values: pd.Series, mapping: dict[str, str]
+) -> tuple[pd.Series, dict[str, int]]:
+    """写像後の Series と、未一致だった値→件数の dict を返す（ログは出さない純粋関数）。"""
+    keys = values.astype("string").str.strip()
+    mapped = keys.map(mapping)
 
+    unmatched_mask = mapped.isna() & keys.notna()
+    result = mapped.where(~unmatched_mask, keys)
 
-def integrate_categories(df: pd.DataFrame, spec: dict) -> pd.Series:
-    """spec に基づき統合カテゴリの Series を返す（df は変更しない）。"""
-    src = spec["source_columns"]
-    missing = [c for c in src.values() if c not in df.columns]
-    if missing:
-        raise KeyError(f"入力に必要なカテゴリ列がありません: {missing}")
+    unmatched_counts = keys[unmatched_mask].value_counts()
+    # 件数降順、値昇順で決定的に並べる。
+    unmatched_counts = unmatched_counts.sort_index().sort_values(ascending=False, kind="stable")
+    unmatched_values = {str(k): int(v) for k, v in unmatched_counts.items()}
 
-    result = pd.Series(pd.NA, index=df.index, dtype="object")
-    assigned = pd.Series(False, index=df.index)
-
-    for rule in spec.get("rules", []):
-        when = rule.get("when", {})
-        mask = pd.Series(True, index=df.index)
-        for level, allowed in when.items():
-            col = src.get(level)
-            if col is None or col not in df.columns:
-                mask &= False
-                continue
-            allowed_list = allowed if isinstance(allowed, (list, tuple)) else [allowed]
-            mask &= df[col].isin(allowed_list)
-        mask &= ~assigned
-        result = result.mask(mask, rule["to"])
-        assigned |= mask
-
-    unset = ~assigned
-    if unset.any():
-        result.loc[unset] = _apply_default(df.loc[unset], src, spec.get("default", {"method": "middle"}))
-        if spec.get("warn_unmatched"):
-            logger.warning(
-                "ルール未一致 %d 行に既定生成(%s)を適用しました。",
-                int(unset.sum()),
-                spec.get("default", {}).get("method", "middle"),
-            )
-    return result
+    return result.astype("object"), unmatched_values
 
 
 def run_category_integration(
     cfg: Config,
     input_path: str,
     output_path: str,
+    *,
+    source_column: str,
+    output_column: str = DEFAULT_OUTPUT_COLUMN,
     map_path: str | None = None,
 ) -> dict:
     """入力 CSV に統合カテゴリ列を付与して出力 CSV に書き出す。"""
@@ -96,15 +78,26 @@ def run_category_integration(
     map_p = Path(map_path) if map_path else DEFAULT_MAP_REL
     if not map_p.is_absolute():
         map_p = root / map_p
-    spec = load_spec(map_p)
+    mapping = load_mapping(map_p)
 
     in_p = Path(input_path)
     if not in_p.is_absolute():
         in_p = root / in_p
     df = pd.read_csv(in_p)
 
-    out_col = spec.get("output_column", "統合カテゴリ")
-    df[out_col] = integrate_categories(df, spec)
+    if source_column not in df.columns:
+        raise KeyError(
+            f"入力に写像元の列がありません: {source_column!r} "
+            f"(実在列: {list(df.columns)})"
+        )
+
+    if output_column in df.columns:
+        logger.warning("出力列 %s は既に存在するため上書きします", output_column)
+
+    mapped, unmatched_values = apply_category_mapping(df[source_column], mapping)
+    df[output_column] = mapped
+
+    n_missing_source = int(df[source_column].isna().sum())
 
     out_p = Path(output_path)
     if not out_p.is_absolute():
@@ -112,7 +105,27 @@ def run_category_integration(
     out_p.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_p, index=False)
 
-    distribution = {str(k): int(v) for k, v in df[out_col].value_counts().items()}
-    logger.info("統合カテゴリ生成: %s -> %s (%d 行, %d 種)", in_p, out_p, len(df), len(distribution))
+    distribution = {str(k): int(v) for k, v in df[output_column].value_counts().items()}
+    logger.info(
+        "統合カテゴリ生成: %s -> %s (%d 行, %d 種)", in_p, out_p, len(df), len(distribution)
+    )
     logger.info("統合カテゴリ分布: %s", distribution)
-    return {"n_rows": len(df), "output": str(out_p), "distribution": distribution}
+    logger.info("写像元が欠損の行: %d 行（NaN のまま出力）", n_missing_source)
+
+    if unmatched_values:
+        n_unmatched_rows = sum(unmatched_values.values())
+        top = list(unmatched_values.items())[:20]
+        top_text = ", ".join(f"{v}={c}" for v, c in top)
+        suffix = f", 他 {len(unmatched_values) - 20} 種" if len(unmatched_values) > 20 else ""
+        logger.warning(
+            "マッピング表に無い値 %d 種 / %d 行を元の値のまま出力しました: %s%s",
+            len(unmatched_values), n_unmatched_rows, top_text, suffix,
+        )
+
+    return {
+        "n_rows": len(df),
+        "output": str(out_p),
+        "distribution": distribution,
+        "n_unmatched": sum(unmatched_values.values()),
+        "unmatched_values": unmatched_values,
+    }

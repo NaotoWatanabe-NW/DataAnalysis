@@ -30,14 +30,14 @@ src/defect_analysis/
   analysis_data.py          分析共通: リーク安全な説明変数の解決
   viz_style.py              可視化スタイル（検証済みパレット+日本語フォント）
   schema_catalog.py         ユーティリティ: CSVスキーマを YAML カタログ化
-  category_integrate.py     ユーティリティ: 大/中/小→統合カテゴリ生成
+  category_integrate.py     ユーティリティ: カテゴリ列→統合カテゴリ生成（CSVマッピング表）
   naming.py                 実データ経路: 列名・ソース名の機械的正規化
   vin_key.py                実データ経路: VIN 正規化（空白除去・base/pass_no 分解・ダミー判定）
   raw_sources.py             実データ経路: data/raw/ の走査・ソース定義
   raw_convert.py             実データ経路: raw CSV → data/lake/ Parquet 変換・読取
   assemble.py                実データ経路: data/lake/ → VIN パネル組立（trend時刻結合含む）
   cli.py                    argparse CLI（サブコマンド方式）
-config/category_map.yaml    統合カテゴリの変換ルール
+config/category_map.csv     統合カテゴリの変換表（value → category）
 data/sample/                サンプル入力（大/中/小カテゴリ）
 tests/test_transforms.py    コア変換ロジックのテスト（unittest）
 main.py                     エントリポイント
@@ -73,17 +73,27 @@ uv run python main.py catalog --input "data/raw/**/*.csv" --output reports/data_
 出力 `reports/data_catalog.yaml` はファイルごとに `file` / `source_name` / `n_rows` /
 `columns[].{name, logical_type, pandas_dtype, n_missing, n_unique, example}` を記録する。
 
-**統合カテゴリ生成**（大/中/小カテゴリ → 統合カテゴリ。変換は [config/category_map.yaml](config/category_map.yaml)）:
+**統合カテゴリ生成**（カテゴリ列 → 統合カテゴリ。変換は [config/category_map.csv](config/category_map.csv)）:
 
 ```bash
 uv run python main.py category \
   --input data/sample/defect_categories.csv \
   --output reports/category_integrated.csv \
-  --map config/category_map.yaml
+  --source-column 中カテゴリ \
+  --output-column 統合カテゴリ \
+  --map config/category_map.csv
 ```
 
-`category_map.yaml` の `rules` を上から評価し最初に一致した割当を採用、未一致は
-`default`（`concat`/`major`/`middle`/`minor`/`const`）で生成する。
+変換表は `value,category` の1対1マッピング表。表に無い値は**元の値のまま**出力され、
+未一致の値と件数が WARNING ログに出る（欠損は欠損のまま）。写像元の列は `--source-column`
+（必須）で指定する。
+
+```csv
+value,category
+締結,締結不良
+溶接,機能系
+塗装,外観系
+```
 
 ### 分析ステージ（EDA → 統計 → 機械学習）
 
@@ -132,11 +142,42 @@ analysis:
   その句だけスキップ。全行が除外される設定は `ValueError` で明確に停止する。
 - `EQ-01__pressure` のようにハイフンを含む列は `query` の識別子にできないため `min`/`max`/`in` で指定する。
 
+#### 追加グラフを config で指定する（`analysis.custom_charts`）
+
+`config.yaml` の `analysis.custom_charts` にグラフ定義を並べると、既存の固定7系統に**加えて**
+追加の EDA グラフを `reports/eda/custom_*.png` に出力する（空リスト `[]` なら従来どおり固定図のみ）。
+
+| type | 必須 | 任意 | 補足 |
+|---|---|---|---|
+| `scatter` | `x`,`y`（数値） | `hue`, `alpha` | 点数が上限超過なら決定的サンプリング |
+| `bar` | `x`（カテゴリ） | `y`（数値）, `agg`, `hue` | `y` 省略時は件数 |
+| `histogram` | `x`（数値） | `bins`, `density`, `hue` | hue 併用時は `density: true` 推奨 |
+| `box` | `y`（数値） | `x`（カテゴリ）, `hue` | `x` 省略時は `y` 単体 |
+| `heatmap` | `columns`（数値列2本以上） | `method`(`pearson`/`spearman`) | `hue` は非対応（WARN して無視） |
+
+共通フィールド: `title` / `output`（`reports/eda/` 配下のファイル名） /
+`filters`（`analysis.filters` と同じ句を図単位で AND 追加適用） / `hue`（色分け列）。
+
+```yaml
+analysis:
+  custom_charts:
+    - {type: scatter, x: EQ-01__pressure, y: EQ-01__stroke, hue: production_shift,
+       title: 圧入 圧力×ストローク, output: custom_pressure_stroke.png}
+    - {type: bar, x: 車種, y: has_repair_record, agg: mean,
+       filters: [{column: process_month, in: ["2026-07"]}]}
+    - {type: heatmap, columns: [EQ-01__pressure, EQ-01__stroke, lead_time_sec], method: spearman}
+  custom_chart_max_hue: 8          # hue 水準数の上限（超過分は頻度上位のみ描画し WARN）
+  custom_chart_max_points: 20000   # scatter の最大描画点数（超過時は決定的サンプリング）
+```
+
+設定ミス（未知の `type`・列が存在しない・型不一致・フィルタ後0行）は**その図だけ** WARNING を出して
+スキップし、他の図の生成は継続する（処理全体は止まらない）。
+
 ## 成果物
 
 | パス | 内容 |
 |---|---|
-| `reports/eda/*.png` | EDA グラフ（全体4図＋設備別の箱ひげ/ヒートマップ。設備数に追従、脚注つき） |
+| `reports/eda/*.png` | EDA グラフ（全体4図＋設備別の箱ひげ/ヒートマップ。設備数に追従、脚注つき）＋ `analysis.custom_charts` で指定した追加図 |
 | `reports/stats/statistical_tests.csv` / `statistical_summary.md` | 統計検定結果・サマリ |
 | `reports/ml/model_performance.csv` | 交差検証の性能比較 |
 | `reports/ml/feature_importance_<target>.csv` | 特徴量重要度（gain / permutation） |
@@ -148,6 +189,7 @@ analysis:
 - `storage.format`: `parquet` | `csv`
 - `analysis.targets`: 分類/回帰の目的変数
 - `analysis.filters` / `filters_on_missing_column`: 分析対象の行フィルタ（EDA/統計/ML 共通。上記「フィルタで対象を絞る」参照）
+- `analysis.custom_charts` / `custom_chart_max_hue` / `custom_chart_max_points`: EDA の追加グラフ宣言（上記「追加グラフを config で指定する」参照）
 - `analysis.leakage_columns` / `leakage_prefixes` / `leakage_regex`: 説明変数から除外する結果由来列
   （明示リスト＋接頭辞＋正規表現の規約で自動除外。新しい結果列が増えても規約で拾えるようにしリーク防止）
 - `analysis.cv_folds` / `test_size` / `random_state`: 交差検証・保持テストの設定
@@ -163,6 +205,8 @@ analysis:
 `repair`（修正実績、`data/raw/repair/defect.csv`）は cp932 エンコーディングかつ独自のクセ（VIN
 先頭の `'`、`00000000 000000` という欠測番兵、`修正日`ではなく`PB_ON`が生産日のアンカー等）を
 持つため専用の追補設計 [docs/real_data_repair_design.md](docs/real_data_repair_design.md) に従う。
+`data/raw/repair/defect_202607.csv`, `defect_202608.csv`, ... のような月単位のファイル分割にも
+コード変更なしで対応している（同一ソースとして自動的にグルーピングされる）。
 repair は VIN 台帳（他ソースとの和集合）には加えず、既存台帳への left join のみで
 `repair_*` 列（すべて `analysis.leakage_prefixes` でリーク除外される）を付与する。
 

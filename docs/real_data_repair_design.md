@@ -388,9 +388,15 @@ def prepare_repair_source(df: pd.DataFrame, source: str, cfg: Config) -> pd.Data
 6. **【確定・2026-07-31】repair の `VIN` に 17 桁フル VIN が 57 行ある**（本体設計 §13-2 と同じ論点）。
    ユーザー確認により、型式ベースと17桁フルVINは国内/国外仕様の差であり同一車体の別表記ではないと
    判明。したがって両形式が同じ車体を指して衝突することはなく、追加の変換・統合は不要。
-7. **1年分の repair ファイルの命名** — 現在は `defect.csv`（日付サフィックスなし）。
-   日付付きの別名になった場合、`source_aliases` の既定 `repair/defect` は当たらなくなり、
-   ソース名が変わってレイクのディレクトリが分かれる。**その時点で alias を追記する運用**とする。
+7. **【確定・2026-08-06】1年分の repair ファイルの命名** — 当初は `defect.csv`（日付サフィックスなし）
+   のみで提供されていたが、`data/raw/repair/defect_202607.csv` / `defect_202608.csv` のように月単位で
+   分割して置く運用でも**コード変更なしで動作することを確認済み**。`naming.source_key()` の
+   `_DATE_SUFFIX_RE`（`_YYYY`/`_YYYYMM`/`_YYYYMMDD` を吸収）が末尾の6桁連続数字（`_202607` 等）を
+   正しく除去するため、`defect_202607.csv` と `defect_202608.csv` はどちらも `source_key` = `defect`
+   に正規化され、既存の `source_aliases` 既定 `{"repair/defect": "修正"}` がそのまま当たって
+   `discover_sources()` は自動的に両ファイルを同一 `RawSource`（`files` に複数月ぶん）としてグルーピングする。
+   ユーザーは `data/raw/repair/defect_202607.csv`, `defect_202608.csv`, ... と月単位でファイルを
+   置くだけでよく、alias の追記は不要（`tests/test_raw_sources.py` で固定化済み）。
 
 ---
 
