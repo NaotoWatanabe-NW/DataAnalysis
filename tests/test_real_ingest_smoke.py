@@ -58,7 +58,10 @@ class RealDataConvertAssembleSmokeTest(unittest.TestCase):
 
             self.assertGreater(assemble_result["n_vin"], 1000)
             self.assertGreater(assemble_result["n_trend_columns"], 0)
-            self.assertEqual(assemble_result["trend_match_rate"], 0.0)
+            # 2026-08-28 時点の data/raw/ は trend と traceability の期間が重なる1か月分データに
+            # 差し替わっており、実際に trend 結合が成立する（旧サンプルは期間非重複で必ず 0.0 だった。
+            # D7 / §12.6 参照）。ここでは「結合の仕組み自体が壊れていないこと」だけを見る。
+            self.assertGreater(assemble_result["trend_match_rate"], 0.0)
 
             panel_path = tmp_path / "interim" / "vin_panel.parquet"
             self.assertTrue(panel_path.exists())

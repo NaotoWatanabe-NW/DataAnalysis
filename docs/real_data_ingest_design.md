@@ -6,36 +6,57 @@ VIN 単位の分析用パネル `data/interim/vin_panel.parquet` を作るまで
 前提事実は [`real_data_facts.md`](real_data_facts.md)。本書はそれに**実測補正**（§1.1）を加えた上で設計する。
 本書は coder がこの1本だけで実装できる粒度を目標とする。実装コードは含まない。
 
+最終更新 2026-08-28: 複数行/VIN ソース（上塗/下塗/ホイ黒ロボット）の**統計量集約と通過時刻集約を全廃**し、
+`{source}__n_rows`（行数）1 列のみにした（D5・§8.1.2・§8.4(2)・§8.5・§9・§11 T11・§12.5・§13-5）。
+
+2026-08-08: (a) 複数行/VIN ソースの `pivot_by` を廃止した（D5・§8.1.2・§9・§10・§12.5）。
+(b) defect ソースの出力列を `{P}__has` の 1 列に簡素化した（D11・§8.1.3・§8.3・§8.5・§9・§11 T6・§12.5・§13-6・§13-7）。
+(c) `size_bin` の既定範囲を 0.0〜2.0mm（0.1mm 刻み・22 列/ソース）に変更した（§8.1.3-A・§9・§11 T9・§12.5）。
+
+2026-08-07: (a) 旧経路（`generate`/`ingest`/`integrate`/`features`）は 2026-08-05 に削除済みのため、
+並存を前提にした記述を過去の事実として書き直した（D1・§2・§3・§9・§11 T8・§12.7）。
+(b) 不良サイズの 0.1mm 刻み集計を追加した（D10・§8.1.3-A・§9・§10・§11 T9・§12.5・§13-6）。
+
 ---
 
 ## 0. 結論（決定事項と根拠）
 
 | # | 決定 | 根拠 |
 |---|---|---|
-| D1 | **既存の合成データ経路（`generate`→`ingest`→`integrate`→`features`）は一切変更せず、実データ経路を別モジュール群として並存させる** | 実データ経路は trend 結合をサンプルで検証できない（期間非重複）。旧経路を壊すと「動く参照実装」と 89 本のテストを同時に失う。追加コストは新モジュール＋CLI サブコマンド2つのみ |
+| D1 | ~~**既存の合成データ経路（`generate`→`ingest`→`integrate`→`features`）は一切変更せず、実データ経路を別モジュール群として並存させる**~~ → **2026-08-05 実行完了・並存解消**。実データ経路が下流（eda/stats/ml）に接続できた時点で旧経路を削除した（`generate.py` / `ingest.py` / `integrate.py` / `features.py`、CLI サブコマンド `all`/`ingest`/`integrate`/`features`、`cli.STAGES` / `ALL_ORDER` / `run_pipeline()`）。詳細は CHANGELOG.md「2026-08-05 — 旧経路（ingest → integrate → features）の削除」 | 決定当時: 実データ経路は trend 結合をサンプルで検証できない（期間非重複）ため、旧経路を壊すと「動く参照実装」とテスト群を同時に失う。**並存は移行期間限定の措置**であり、下流接続の完了をもって役目を終えた |
 | D2 | **2段構成にする: `convert`（raw CSV → Parquet レイク）と `assemble`（レイク → VIN パネル）** | 1年分 10GB を毎回 CSV から読むのは不可。変換は増分・冪等、業務判断は組立側に閉じる |
 | D3 | **列名は人手のマッピング表を作らず、機械的規則（NFKC＋特殊文字置換）で正規化する。元名との対応は毎回レポート出力する** | 全 22 ファイル 2446 列を実測した結果、特殊文字は `空白 # ( ) - & _` の7種のみ。規則適用後の衝突は**全ファイルでゼロ**（実測）。表の手保守は不要 |
 | D4 | **VIN 正規化は `strip()` ではなく「全空白除去」**。サフィックス（`a`〜`c`）は既定 `keep`（別キー扱い）。`DUMMY*`/`EMPTY` は組立時に除外 | サフィックス付き VIN は空白が**内部**にある（`"HE93S-122023     a"`）ため `strip()` では消えない（§1.1）。keep の根拠は §6 |
-| D5 | **複数行/VIN ソース（上塗/下塗/ホイ黒ロボット）は既定で統計量集約（mean/min/max/std＋行数）。pivot は config で opt-in** | `ﾛﾎﾞｯﾄ#` で pivot すると上塗だけで約 600 列。まず集約で当たりを付け、必要な設備だけ pivot を有効化する |
+| D5 | **複数行/VIN ソース（上塗/下塗/ホイ黒ロボット）は `{source}__n_rows`（行数）1 列のみを持つ。数値列・日時列・文字列列の集約も pivot も一切行わない** | `ﾛﾎﾞｯﾄ#` で pivot すると上塗だけで約 600 列になる。**2026-08-08 改定**: 「必要な設備だけ config で opt-in」する pivot 設計を実装前に廃止した（`pivot_by` キー・列数ガード・関数引数ごと削除。opt-in オプションが一度も使われないまま仕様と実装の分岐だけが残ることを避ける）。**2026-08-28 改定**: 残っていた統計量集約（数値 mean/min/max/std・日時 min/max・文字列 nunique/first）も**ユーザー判断により全廃**し、行数のみを残した。理由は「これらの統計量が実際には使われていない」ことと、p パネルの列数削減（複数行由来 184 列 → 3 列。§8.5）による p ≫ n 対策の優先。**通過時刻（`time_column`）の集約も同時に廃止する**ため、複数行/VIN ソースは trend アンカーになり得なくなる（§8.4(2)。実データでは元々アンカーに使われていないので結合結果は変わらない） |
 | D6 | **trend は「trend 列の先頭トークン → 対応する traceability ソースの通過日時」を規則で解決し、アンカー別に「rolling 窓集約済み trend への最近傍点参照（`merge_asof`）」で結合する** | 前処理〜上塗は数時間離れており、単一アンカーだと1分粒度データの意味が消える。中心窓平均は `merge_asof` 単体では作れないため、trend 側で先に rolling する（§8.4） |
 | D7 | **サンプルでは trend×VIN のマッチ率が 0% になる。既定挙動は「WARN＋trend 列を全 NaN で生成」** | 下流が列の有無で分岐せずに済み、欠損率レポートで「結合できていない」ことが可視化される。`skip`/`error` も config で選択可 |
 | D8 | ~~**repair は optional。ソース0件でも INFO ログのみで正常終了**~~ → **2026-07-31 破棄**。`data/raw/repair/defect.csv`（cp932）が配置されたため取り込む。差分設計は [`real_data_repair_design.md`](real_data_repair_design.md) | 当時 `data/raw/repair/` が空だったため。ソース0件でも正常終了する挙動自体は維持する |
 | D9 | **defect 由来の列は必ず `defect_` で始める** | 既存 `config.yaml` の `analysis.leakage_prefixes` にそのまま乗り、リーク列の自動除外が効く |
+| D10 | **不良サイズの 0.1mm 刻みカウント列は「config で固定した範囲」でのみ生成し、既定は off** | 観測レンジからビンを動的に決めると電着ブツ検の外れ値（max = 1,462,978.45mm）だけで約 1,460 万列になる。固定範囲なら列集合が入力データに依存せず、日次実行の間でパネルのスキーマが安定する（§8.1.3-A）。**2026-08-08 追記**: D11 で defect を `__has` のみに簡素化した結果 size_bin が唯一のサイズ情報になったが、ユーザー確認により**既定 off を維持する**と確定した（`has` だけで足りる分析が大半のため。§8.1.3-A(3)）。既定範囲は 0.0〜2.0mm・0.1mm 刻み（22 列/ソース）に変更 |
+| D11 | **defect ソースの出力列は `{P}__has`（存在フラグ）1 列のみ。サイズ分布が要る場合だけ `by_size_bin` で opt-in する** | 2026-08-08 ユーザー判断。`__count` / `__size_mean`・`__size_max`・`__size_sum` / `__first_ts`・`__last_ts` / `__n_kind`・`__n_part` / `__top_kind` / `__kind__*` / `__part__*` は使わないため全廃した。`has` は「1 = そのソースに登場した」「NaN = 未検査」の意味で、**0 埋めしない**（§13-7） |
 
-後方互換の要否についての判断: **旧経路との後方互換は「触らない」形で維持する**。
-実データ経路の出力先は旧経路と別ファイル（`vin_panel.parquet` / `data/lake/`）にして衝突を避ける。
-ただし恒久並存はさせない — 実データパネルが下流（eda/stats/ml）に接続できた時点で、
-`generate.py` と合成データ経路を「廃止候補」として README に明記し、次フェーズで削除する。
+後方互換についての当時の判断（**2026-08-05 に完了済み**）: 移行期間中は旧経路と出力先を分け
+（`vin_panel.parquet` / `data/lake/`）、旧経路には手を触れない形で並存させていた。
+実データパネルが下流（eda/stats/ml）に接続できた時点で計画どおり旧経路を削除し、
+現在は実データ経路のみが存在する（CLI: `convert` → `assemble` → `eda`/`stats`/`ml`）。
+経緯は CHANGELOG.md 2026-08-05 の項を参照。**以降の記述で「旧経路」に言及する箇所はすべて過去の事実である。**
 
 ---
 
 ## 1. 前提事実（設計に効くものだけ再掲）
 
 - エンコーディングは全ファイル `utf-8-sig`。
-- 日時形式は**全ファイル `%Y/%m/%d %H:%M:%S` で完全一致**（実測: traceability/defect/trend の代表ファイル）。→ `pd.to_datetime(..., format=...)` を明示指定する（10GB 規模では推論のコストが致命的）。
+- 日時形式は**ソースによって秒あり `%Y/%m/%d %H:%M:%S` / 秒なし `%Y/%m/%d %H:%M` が混在する**
+  （2026-07-30 時点のサンプルでは全ファイル秒ありで一致していたが、2026-08-28 に実データに近い
+  1か月分へ差し替えた結果、ブース・上塗ロボット・下塗ロボット（traceability）と trend 全7ソースが
+  秒なしであると判明。詳細は `docs/real_data_facts.md` §6）。→ `pd.to_datetime(..., format=...)` を
+  明示指定した上で、主フォーマット失敗分だけ `datetime_format_fallbacks` で再トライする（§7.2）。
+  10GB 規模では format 推論（`format="mixed"` 等）のコストが致命的なため、明示フォーマットの
+  組み合わせで対応する。
 - ファイル名の `_202607` は年月だが中身は1日分。**ファイル名から日付・設備を導出してはならない**（§4）。
 - trend は VIN を持たず `DATETIME` 1分グリッド（1173行/日、全 trend ファイルで同一グリッド）。
-- trend と traceability/defect の**期間が重複しない**（trend=07/29-30、他=07/24-25）。
+- trend と traceability/defect の**期間**は、当初の1日分サンプルでは重複しなかったが
+  （trend=07/29-30、他=07/24-25）、2026-08-28 差し替え後の1か月分データでは重複する（§8.4(4)）。
 - `data/raw/repair/` は空。
 
 ### 1.1 `real_data_facts.md` への実測補正（重要）
@@ -62,9 +83,10 @@ raw CSV の発見 → 列名正規化 → 日付パーティション Parquet �
 ソース別集約 → VIN 横結合 → trend 時刻結合 → `vin_panel.parquet` ＋ 品質レポート出力。
 
 ### やらない（本書のスコープ外）
-- `vin_panel` を既存 `features/eda/stats/ml` に接続する改修（別タスク）。
+- `vin_panel` を `eda`/`stats`/`ml` に接続する改修（別タスクとして実施済み。`analysis_data.load_real_panel()` が
+  `real_ingest.panel_path` を読む）。
 - 目的変数の定義変更・特徴量選択・モデリング。
-- 旧経路（`generate/ingest/integrate/features`）の改修・削除。
+- 旧経路（`generate/ingest/integrate/features`）の改修・削除（**2026-08-05 に別タスクで削除済み**。D1）。
 
 ---
 
@@ -84,9 +106,9 @@ raw CSV の発見 → 列名正規化 → 日付パーティション Parquet �
 
 | ファイル | 変更内容 |
 |---|---|
-| `cli.py` | サブコマンド `convert` / `assemble` を追加。`STAGES` / `ALL_ORDER` は**変更しない** |
+| `cli.py` | サブコマンド `convert` / `assemble` を追加（当時の並存期は `STAGES` / `ALL_ORDER` を変更しない方針だったが、**2026-08-05 に旧経路ごと削除済み**。D1） |
 | `config/config.yaml` | 新セクション `real_ingest:` を追加（既存キーは変更しない） |
-| `README.md` | 実データ経路の章を追加、旧経路を「合成データ用（廃止候補）」と明記 |
+| `README.md` | 実データ経路の章を追加（**2026-08-05 以降は実データ経路のみを説明する内容に更新済み**） |
 | `docs/real_data_facts.md` | §1.1 の補正を追記 |
 
 責務境界のルール:
@@ -268,8 +290,14 @@ def save_manifest(path: Path, data: dict) -> None
 3. チャンク毎に:
    1. `normalize_columns()` で列名を正規化（`rename_map` は初回チャンクのものを採用）。
    2. `time_column` および `通過日時` を含む全列を
-      `pd.to_datetime(..., format="%Y/%m/%d %H:%M:%S", errors="coerce")` で変換。
-      NaT 率が `max_datetime_parse_failure_rate`（既定 1%）を超えたら WARN。
+      `pd.to_datetime(..., format=datetime_format, errors="coerce")` で変換。
+      主フォーマットで失敗した値（既存 NaN を除く）だけ、`datetime_format_fallbacks` を
+      順に再トライして埋める（**2026-08-28 追加**。ソースにより秒あり/秒なしが混在するため。
+      §1・`docs/real_data_facts.md` §6）。パース結果は必ず `.dt.as_unit("us")` で解像度を揃える
+      （主フォーマットが列内で全滅すると pandas が `datetime64[s]` と推定し、フォールバック結果
+      `datetime64[us]` と食い違うと §8.4 の `merge_asof` が例外を投げるため）。
+      NaT 率（既存 NaN を除く。フォールバックを尽くしてもなお失敗した分）が
+      `max_datetime_parse_failure_rate`（既定 1%）を超えたら WARN。
    3. VIN 列があれば `normalize_vin()` で `vin/vin_base/vin_pass_no/vin_is_dummy` を追加し、
       元列を `vin_raw` にリネーム。
    4. `float64` 列を `float32` にダウンキャスト（`downcast_float: true` のとき）。
@@ -319,21 +347,17 @@ def prepare_single_row_source(df: pd.DataFrame, source: str) -> pd.DataFrame
 #### 8.1.2 複数行/VIN ソース（上塗ロボット ≈30行・下塗ロボット ≈19行・ホイ黒ロボット 2行）
 
 ```python
-def prepare_multi_row_source(df, source, aggs: list[str], pivot_by: list[str] | None) -> pd.DataFrame
+def prepare_multi_row_source(df, source) -> pd.DataFrame
 ```
-- `pivot_by` が空（既定）:
-  - 数値列 → `aggs`（既定 `["mean","min","max","std"]`）→ `{source}__{col}__{agg}`
-  - 日時列 → `min`/`max` → `{source}__{col}__min` / `__max`（`time_column` の `min` が trend アンカー）
-  - 文字列列 → `nunique` と `first` → `{source}__{col}__nunique` / `__first`
-  - 追加: `{source}__n_rows`（行数）
-- `pivot_by` に列を指定した場合（例 `["ロボット"]`）:
-  `pivot_table(index="vin", columns=pivot_by, values=数値列, aggfunc="mean")` →
-  `{source}__{pivot値}__{col}`。pivot 値は `normalize_name()` を通す（`Pi-1L` → `Pi_1L`）。
-  pivot 後の列数が `assemble.max_columns_per_source`（既定 200）を超えたら **`ValueError` で中断**
-  （気付かずに数千列を作らないためのガード）。実データで `上塗ロボット` を `ロボット` で pivot すると
-  約 600 列になるため、既定設定では必ずこのガードに当たる。有効化する場合は同時に閾値も上げる必要がある。
+- **VIN ごとの行数だけを数えて返す**（D5・2026-08-28 改定）:
+  - `df.groupby("vin").size()` を `{source}__n_rows` という列名にした 1行/VIN の DataFrame
+    （結合キー `vin` を列として持つ）を返す。
+  - **数値列・日時列・文字列列に対する集約は一切行わない**。設備別 pivot も提供しない。
+- したがって `time_column` もパネルに残らない。このソースは trend アンカーになり得ない（§8.4(2)）。
+- 引数から `aggs` を削除する（旧 `pivot_by` は 2026-08-08 に削除済み）。config 側の上書き設定も撤廃する（§9）。
 
-列数試算（既定設定・1日分）: 上塗ロボット ≈ 84、下塗 ≈ 44、ホイ黒 ≈ 56。
+列数試算（1日分）: **1 ソースあたり 1 列**（`n_rows` のみ）。3 ソース合計 3 列
+（旧: 上塗ロボット ≈ 84・下塗 ≈ 44・ホイ黒 ≈ 56 の計 184 列）。
 
 #### 8.1.3 defect ソース（上塗ブツ検・電着ブツ検）
 
@@ -344,18 +368,118 @@ def prepare_defect_source(df, source, cfg) -> pd.DataFrame
 
 | 列 | 内容 |
 |---|---|
-| `{P}__count` | 不良点数（行数） |
-| `{P}__has` | 1（存在フラグ。台帳結合後に 0 埋め） |
-| `{P}__size_mean` / `__size_max` / `__size_sum` | `不良サイズ` を `to_numeric(errors="coerce")` した統計量 |
-| `{P}__first_ts` / `__last_ts` | `入口_通過日時` の min/max |
-| `{P}__n_kind` / `__n_part` | `不良種類` / `検査部位` の nunique |
-| `{P}__top_kind` | 最頻の `不良種類` |
-| `{P}__kind__{正規化不良種類}` | 不良種類別カウント（`crosstab`）。`defect.by_kind: true` のとき |
-| `{P}__part__{正規化検査部位}` | 検査部位別カウント。**既定 off**（部位は 20 種以上あり列爆発する） |
+| `{P}__has` | 存在フラグ。そのソースに 1 行以上ある VIN は `1`。**台帳結合後の 0 埋めはしない**ため、登場しない VIN は `NaN`（= 未検査）のまま残る（§13-7）。すなわち `1` / `NaN` の 2 値 |
 
-- `検査箇所` は `検査箇所X` + `-` + `検査箇所Y` の冗長列なので drop（`defect.drop_columns` で指定）。
-- 種類別カウント列は「そのデータに出現した種類」から動的生成し、生成した一覧を
-  `reports/ingest_quality.csv` に記録する（config に手書きしない）。
+- **2026-08-08 改定（D11）**: 従来出していた `__count` / `__size_mean`・`__size_max`・`__size_sum` /
+  `__first_ts`・`__last_ts` / `__n_kind`・`__n_part` / `__top_kind` / `__kind__*` / `__part__*` は
+  ユーザー判断により**全廃**した。したがって defect ソースの CSV からパネルに入るのは `vin`
+  （＋ `by_size_bin` 有効時の `不良サイズ`）だけで、`検査箇所` 等の冗長列を個別に drop する設定も不要になった。
+- サイズ分布が必要な場合のみ、§8.1.3-A の `{P}__size_bin__{ビンラベル}`（`defect.by_size_bin`、
+  **既定 off**。D10）を config で明示的に有効化する。既定設定では defect 由来の列は
+  `{P}__has` だけ（2 ソースで 2 列）である。
+
+##### 8.1.3-A 不良サイズの 0.1mm 刻み集計（`size_bin`、追加・2026-08-07 / 既定範囲変更・2026-08-08）
+
+```python
+def size_bin_labels(bin_min: float, bin_max: float, bin_width: float) -> list[str]
+    """ビン列の**ラベル**（正規化前）を昇順で返す。データを見ずに config だけで決まる。
+       戻り値の先頭は下限未満ビン、末尾は上限以上ビン。"""
+
+def prepare_defect_size_bins(size_numeric: pd.Series, vin: pd.Series, prefix: str,
+                             cfg_defect: dict) -> pd.DataFrame
+    """VIN × ビンのカウント表を返す。`prepare_defect_source()` から呼び、
+       `{P}__has` の表に `result.join(..., how="left")` で連結する。"""
+```
+
+**(1) ビン範囲は config の固定値で決める（観測データから動的に決めてはならない）**
+
+- 区間は**半開区間 `[lo, lo + width)`**。`bin_min` から `bin_max` まで `bin_width` 刻みで並べ、
+  両端に番兵ビンを 1 つずつ置く: `(-∞, bin_min)` と `[bin_max, +∞)`。
+  → 生成列数は常に `round((bin_max - bin_min) / bin_width) + 2` で、**入力データに依存しない**。
+- **動的レンジ禁止の根拠（2026-08-07 実測、`data/raw/defect/*.csv` の1日分）**:
+
+  | ソース | 行数 | min | 25% | 中央値 | 75% | 99% | max | ユニーク値 |
+  |---|---|---|---|---|---|---|---|---|
+  | 上塗ブツ検 | 8,024 | 0.600 | 0.697 | 0.871 | 1.622 | 15.20 | 57.57 | 7,904 |
+  | 電着ブツ検 | 21,726 | 0.600 | 0.736 | 0.982 | 1.756 | 29.77 | **1,462,978.45** | 21,194 |
+
+  欠損は両ソースとも 0 件。電着ブツ検の max は物理的にありえない値であり、**データ品質問題**と判断する
+  （この 1 件のせいで平均が 177mm まで歪む）。観測レンジで機械的にビンを切ると
+  上塗ブツ検で約 570 列、電着ブツ検では**約 1,460 万列**になり、
+  `max_columns_per_source` ガードで防ぎたい列爆発そのものになる。
+- 動的レンジを禁じる理由はもう 1 つある: **列集合がその実行で読んだ期間に依存して変わる**こと。
+  `--date-from/--date-to` を変えるたびにパネルのスキーマが変わると、日次の再実行結果を比較できず、
+  下流（eda/stats/ml）の列指定も壊れる。固定範囲なら列集合は config だけで決まり安定する。
+- 既定値は `bin_min: 0.0` / `bin_max: 2.0` / `bin_width: 0.1`（**2026-08-08 変更**。旧: 0.6〜5.0）
+  → 20 + 2 = **22 列/ソース**（2 ソースで 44 列）。旧既定の 46 列/ソースから減った。
+- **既定範囲のカバー率（2026-08-08 実測、`data/raw/defect/*.csv` の 1 日分）**:
+
+  | ソース | 非 NaN 件数 | `[0.0, 2.0)` | 割合 | `>= 2.0`（上限以上ビン） | 割合 | `< 0.0`（下限未満ビン） |
+  |---|---|---|---|---|---|---|
+  | 上塗ブツ検 | 8,024 | 6,333 | 78.9% | 1,691 | 21.1% | 0 |
+  | 電着ブツ検 | 21,726 | 16,899 | 77.8% | 4,827 | 22.2% | 0 |
+
+  範囲外は上限以上ビン（`2.0以上`）に集約される。実データの最小値は 0.600 のため下限未満ビンは
+  常に 0 件だが、負値・異常値の受け皿として番兵ビンは維持する。上側をもっと細かく見たい場合は
+  `size_bin_max` を config で引き上げる（列数は `round((max - min) / width) + 2` で増える）。
+- **ガード**: `round((bin_max - bin_min) / bin_width) + 2` が `assemble.max_columns_per_source`（既定 200）を
+  超える場合は、データを読む前に `ValueError` で中断する（§10 の表にも記載）。
+  ビン数は config だけで確定するため、この検査は `prepare_defect_source()` の冒頭で行える。
+  **2026-08-28 追記**: `(bin_max - bin_min)` が `bin_width` の整数倍でない場合も同様に `ValueError` で
+  中断する（実装レビューで発見。割り切れないと最後の通常ビンが `bin_max` を超えて生成され、
+  `{bin_max}以上` ラベルと実際の境界がずれ、`n_size_over` の集計ともズレるバグがあったため）。
+- 浮動小数の丸め誤差を避けるため、**境界は `bin_width` の整数倍のインデックス（0.1mm 単位なら 1/10 の整数）で
+  生成し、最後に `float` に戻す**（`np.arange(0.0, 2.0, 0.1)` を直接使うと `0.7000000000000001` が出る）。
+
+**(2) 列名（`naming.normalize_name()` / `prefixed()` を使う）**
+
+ラベルは一度「人が読める文字列」で作り、必ず `normalize_name()` を通してから
+`{P}__size_bin__{正規化ラベル}` に埋め込む。`normalize_name()` は `.` と `-` をどちらも
+`SPECIAL_CHARS` として `_` に落とす点に注意する（実測確認済み）:
+
+| 意味 | ラベル（正規化前） | `normalize_name()` 後 | 最終列名の例 |
+|---|---|---|---|
+| `[0.0, 0.1)` | `0.0-0.1` | `0_0_0_1` | `defect_上塗ブツ検__size_bin__0_0_0_1` |
+| `[1.0, 1.1)` | `1.0-1.1` | `1_0_1_1` | `defect_上塗ブツ検__size_bin__1_0_1_1` |
+| `[1.9, 2.0)` | `1.9-2.0` | `1_9_2_0` | `defect_上塗ブツ検__size_bin__1_9_2_0` |
+| 下限未満 `(-∞, 0.0)` | `0.0未満` | `0_0未満` | `defect_電着ブツ検__size_bin__0_0未満` |
+| 上限以上 `[2.0, +∞)` | `2.0以上` | `2_0以上` | `defect_電着ブツ検__size_bin__2_0以上` |
+
+- 端点は必ず `f"{x:.1f}"` 相当の**固定小数点表記**で作る（`bin_width` が 0.1 以外なら小数桁数は
+  `bin_width` から決める）。桁数を固定しないと `1.0-1.1` と `1-1.1` が両方生じ、正規化後に衝突し得る。
+- この規則で生成されるラベル集合内では正規化後の名前は一意になる（グリッドが等間隔・同桁数のため）。
+  それでも `normalize_columns()` の衝突解決（`__2` 付与）には**頼らない** —
+  衝突が起きたら設定ミスなので `ValueError` で落とす。
+- 日本語（`未満` / `以上`）は `SAFE_PATTERN` で保持される（実測確認済み）ため、そのまま列名に使える。
+
+**(3) 既定は off（2026-08-08 再確認・確定）**
+
+`by_size_bin: false` を既定とする。D11 でサイズ統計量列（`__size_mean` / `__size_max` / `__size_sum`）を
+廃止したため size_bin は**唯一のサイズ情報**になったが、**この状態でも既定 off を維持する**ことが
+ユーザー確認により 2026-08-08 に確定した（D10 の追記）。
+根拠: 大半の分析は「その VIN が検査で不良を出したか（`{P}__has`）」だけで足り、
+常時 22 列/ソース（2 ソースで 44 列）を全 VIN に付ける必要はない。分布の形が要る分析のときだけ
+config で `by_size_bin: true` にして opt-in する。
+**したがって既定設定では、パネルにサイズ情報は一切含まれない**（この点は意図した仕様である）。
+
+**(4) 値と欠損の扱い**
+
+- 集計対象は `to_numeric(errors="coerce")` 後の `不良サイズ`。NaN の行はどのビンにも入れない。
+- カウントは int。**そのソースに登場する VIN** については、該当が無いビンにも 0 を入れる。
+- **台帳結合後の 0 埋めはしない**。defect ソースに一切登場しない VIN は「未検査」であり
+  「不良ゼロ」と区別する必要があるため NaN のまま残す（§13-7 / `_zero_fill_after_merge` の対象外）。
+- 不変条件（テストで使う）: 1 VIN のビン列の合計 == その VIN の `不良サイズ` が非 NaN の行数。
+
+**(5) `reports/ingest_quality.csv` への記録**
+
+- 生成したビン一覧を `categories` セルに `;` 区切りで記録する。ビンには `size_bin:` を前置する
+  （例: `size_bin:0_0未満;size_bin:0_0_0_1;…;size_bin:2_0以上`）。
+  D11 で種類別カウント（`by_kind`）を廃止したため、defect の `categories` に入るのはビン一覧のみになる。
+- 加えて次の 2 列を `ingest_quality.csv` に追加する。**電着ブツ検の外れ値を検知するための実質的な指標**であり、
+  ビン一覧そのものより価値が高い:
+  - `n_size_under`: `bin_min` 未満だった不良の件数（既定範囲の実測では両ソースとも 0）
+  - `n_size_over`: `bin_max` 以上だった不良の件数（既定範囲の実測では上塗 1,691 / 電着 4,827）
+- `by_size_bin: false` のときはビン列を生成せず、`n_size_under` / `n_size_over` は空欄にする。
 
 ### 8.2 VIN 台帳（base）
 
@@ -373,7 +497,9 @@ def build_vin_ledger(frames: dict[str, pd.DataFrame]) -> pd.DataFrame
 
 台帳に対して各ソースフレームを `merge(on="vin", how="left", validate="one_to_one")` で順に結合。
 `validate` は必ず付ける（集約後は 1行/VIN が保証されるはずで、崩れていれば即検知したい）。
-結合後に `present__*` / `defect_*__has` / `{P}__count` / `{P}__kind__*` を 0 埋め。
+結合後に `present__*` を 0 埋めする。**`defect_*__has`（および opt-in の `defect_*__size_bin__*`）は
+0 埋めしない** — defect ソースに一切登場しない VIN は「未検査」であり「不良ゼロ」と区別する必要があるため
+NaN のまま残す（§13-7）。
 
 ### 8.4 trend の時刻結合
 
@@ -397,8 +523,9 @@ def join_trend(base: pd.DataFrame, trend_wide: pd.DataFrame, cfg) -> tuple[pd.Da
 - グリッド欠測は補完しない（rolling の `min_periods=1` で吸収）。
 
 **(2) アンカー解決（trend 列 → どの通過時刻に合わせるか）**
-- `anchor_columns` = `{traceability ソース名: base 内のアンカー列名}`
-  （1行/VIN は `{source}__{time_column}`、複数行/VIN は `{source}__{time_column}__min`）。
+- `anchor_columns` = `{traceability ソース名: base 内のアンカー列名}`。アンカーになるのは
+  **1行/VIN ソースの `{source}__{time_column}` のみ**（複数行/VIN ソースは `{source}__n_rows` しか
+  持たず `time_column` がパネルに存在しないため、アンカーになり得ない。§8.1.2・2026-08-28 改定）。
 - trend 列名から `trend__` を除去し、`_` で split した**先頭トークン** `t` を取る。
   例: `ブース_1_4_結露防止_運転モード` → `ブース` / `前処理_0_通常_運転モード` → `前処理` /
   `シーラー炉_全体_バーナー_...` → `シーラー炉`。
@@ -406,6 +533,10 @@ def join_trend(base: pd.DataFrame, trend_wide: pd.DataFrame, cfg) -> tuple[pd.Da
   1. `trend.anchor_map` に `t` のエントリがあればそのソース（既定 `{}`）。
   2. `t` と完全一致する traceability ソース名。
      → 実測で `シーラー炉` / `中上炉` / `電着炉` / `前処理` / `電着` / `ブース` / `浮遊ゴミ` が一致する。
+     この一覧に**上塗ロボット / 下塗ロボット / ホイ黒ロボットは含まれない**（実データの trend 列
+     トークンにこれらの設備名で始まるものが無いため）。つまり複数行/VIN ソースは 2026-08-28 の改定
+     以前から実質的にアンカーとして使われておらず、**今回の time_column 集約廃止は実データでの
+     trend 結合結果（アンカー割当・マッチ率）を変えない**。
   3. `t` を接頭辞に持つソース名、または `t` の接頭辞になっているソース名（`ブース_1` → `ブース`）。
   4. 解決不能 → `trend.fallback_anchor_source`（既定 `ブース`）。
      1日分の実測で解決不能なトークンは `コンベア` / `冷水供給` / `温水供給` / `作業場空調` /
@@ -439,8 +570,12 @@ def join_trend(base: pd.DataFrame, trend_wide: pd.DataFrame, cfg) -> tuple[pd.Da
   - `skip`: trend 列を生成しない。
   - `error`: `ValueError` で中断。
 - `0 < マッチ率 < trend.min_match_rate`（既定 0.5）なら WARN のみ（列は生成）。
-- **現サンプルデータでは必ずマッチ率 0 になる**（trend 07/29-30 vs traceability 07/24-25）。
-  これは実装の誤りではない。tester はこの経路を「WARN が出て trend 列が全 NaN」として検証すること（§12）。
+- **2026-07-30 時点の1日分サンプルではマッチ率が必ず 0 になっていた**（trend 07/29-30 vs
+  traceability 07/24-25）。これは実装の誤りではなく、tester はこの経路を「WARN が出て trend 列が
+  全 NaN」として fixture で検証する（§12）。**2026-08-28 追記**: `data/raw/` が期間の重なる
+  1か月分の実データに差し替わった結果、実際にマッチ率 78〜85%（VIN 21,020件）を実測した。
+  `on_no_overlap` 分岐自体（期間非重複時の安全策）は今後も必要だが、「サンプルでは必ず0%」という
+  記述は当時のサンプル固有の事実であり、一般には成立しない。`docs/real_data_facts.md` §6 参照。
 
 ### 8.5 出力
 
@@ -449,16 +584,22 @@ def join_trend(base: pd.DataFrame, trend_wide: pd.DataFrame, cfg) -> tuple[pd.Da
 | `data/interim/vin_panel.parquet` | VIN × 全列のパネル |
 | `reports/vin_panel_dictionary.csv` | 列名・dtype・欠損数・ユニーク数・例・由来ソース |
 | `reports/column_name_mapping.csv` | 正規化後 → 元列名（convert 側で出力） |
-| `reports/ingest_quality.csv` | ソース別: 採用ファイル数・行数・VIN 数・ダミー除外数・重複数・日時パース失敗数・動的生成カテゴリ一覧 |
+| `reports/ingest_quality.csv` | ソース別: 採用ファイル数・行数・VIN 数・ダミー除外数・重複数・日時パース失敗数・動的生成カテゴリ一覧（defect で `by_size_bin` 有効時のみビン一覧 `size_bin:*` と `n_size_under` / `n_size_over` が入る。§8.1.3-A(5)） |
 | `reports/trend_anchor_map.csv` | trend 列トークン → アンカーソース → アンカー列・解決経路 |
 | `reports/trend_join_report.csv` | アンカー別マッチ率と期間 |
 
 `assemble()` の戻り値: `{"n_vin": int, "n_columns": int, "n_trend_columns": int, "trend_match_rate": float}`。
 
-規模試算（既定設定・1日分）: 約 1,300 行 × 約 1,870 列
-（traceability 単行 745 ＋ 複数行 184 ＋ defect ≈ 40 ＋ trend ≈ 891）。
+規模試算（既定設定・1日分）: 約 1,300 行 × 約 1,641 列
+（traceability 単行 745 ＋ 複数行 3 ＋ defect 2 ＋ trend ≈ 891）。
+複数行/VIN は 2026-08-28 改定（D5）により 1 ソース 1 列（`n_rows`）＝ 3 ソースで **3 列**（旧 184 列）。
+defect は D11 により既定で `__has` × 2 ソース = **2 列**のみ。両ソースで `by_size_bin: true` に
+した場合でも 2 + 44 = 最大 46 列（§8.1.3-A）。
+実測との対応: 2026-08-07 に実データで `assemble` を実行したときの合計は 1,916 列（うち defect 関連 26 列）。
+D11 の defect 簡素化（26 → 2 列）で 1,892 列、さらに今回の複数行/VIN 簡素化（184 → 3 列）で
+およそ **1,711 列**になる見込み（repair 列を含むため上の理論値より多い）。
 **p ≫ n であることを README に明記する**（特徴量選択が別途必須）。
-1年分（約 32 万 VIN × 1,870 列 float32 ≈ 2.3GB）では `assemble.date_from/date_to` と
+1年分（約 32 万 VIN × 1,641 列 float32 ≈ 2.1GB）では `assemble.date_from/date_to` と
 `trend.include_columns` による絞り込みが前提。CLI に `--date-from/--date-to` を必ず付ける。
 
 ---
@@ -470,7 +611,7 @@ def join_trend(base: pd.DataFrame, trend_wide: pd.DataFrame, cfg) -> tuple[pd.Da
 ```yaml
 # ---------------------------------------------------------------------
 # 実データ取り込み（docs/real_data_ingest_design.md）
-#   旧 ingest/integrate（合成データ経路）とは独立。CLI: convert / assemble
+#   CLI: convert / assemble（旧 ingest/integrate は 2026-08-05 に削除済み。D1）
 # ---------------------------------------------------------------------
 real_ingest:
   raw_dir: data/raw
@@ -482,6 +623,7 @@ real_ingest:
   convert:
     encoding: utf-8-sig
     datetime_format: "%Y/%m/%d %H:%M:%S"
+    datetime_format_fallbacks: ["%Y/%m/%d %H:%M"]   # 主フォーマット失敗分だけ再トライ（秒なしソース対応。2026-08-28）
     chunksize: 200000
     downcast_float: true
     keep_float64_suffixes: ["積算値", "総合計"]   # 精度維持する列の末尾トークン
@@ -492,22 +634,15 @@ real_ingest:
     suffix_policy: keep        # keep（既定・別キー） | merge（vin_base で丸める）
     exclude_regex: "(?i)(DUMMY|EMPTY)"
 
-  sources:                     # ソース名（正規化後）ごとの上書き。書かなければ defaults
-    上塗ロボット: {aggs: [mean, min, max, std], pivot_by: []}
-    下塗ロボット: {aggs: [mean, min, max, std], pivot_by: []}
-    ホイ黒ロボット: {aggs: [mean, min, max, std], pivot_by: []}
-  defaults:
-    aggs: [mean, min, max, std]
-    pivot_by: []
+  # 複数行/VIN ソースは {source}__n_rows のみを出力するため設定項目は無い（D5・§8.1.2）
 
-  defect:
-    size_column: 不良サイズ    # 正規化後の列名
-    kind_column: 不良種類
-    part_column: 検査部位
-    time_column: 入口_通過日時
-    by_kind: true              # 不良種類別カウント列を作る
-    by_part: false             # 検査部位別カウント列（列爆発するため既定 off）
-    drop_columns: [検査箇所]   # X/Y の冗長列
+  defect:                      # 出力は {P}__has のみ（D11）。種類/部位/時刻系のキーは 2026-08-08 に廃止
+    size_column: 不良サイズ    # 正規化後の列名（size_bin を有効化したときだけ使う）
+    # 不良サイズの 0.1mm 刻みカウント列（§8.1.3-A / D10）。範囲は必ず固定値で与える。
+    by_size_bin: false         # true で {P}__size_bin__* を生成（既定 off。22 列/ソース増える）
+    size_bin_width: 0.1        # ビン幅[mm]（> 0）
+    size_bin_min: 0.0          # 下限[mm]。これ未満は "{size_bin_min}未満" ビンへ
+    size_bin_max: 2.0          # 上限[mm]。これ以上は "{size_bin_max}以上" ビンへ（外れ値の吸収先）
 
   trend:
     enabled: true
@@ -527,8 +662,18 @@ real_ingest:
     date_from: null            # "2026-07-24"（null で全期間）
     date_to: null
     require_sources: []        # 0 行なら ValueError にするソース名
-    max_columns_per_source: 200
+    max_columns_per_source: 200   # size_bin の列数ガード（§8.1.3-A）。pivot 廃止後はこの用途のみ
 ```
+
+**2026-08-28 撤廃するキー**: `real_ingest.sources`（ソース別の上書き）と `real_ingest.defaults`
+（`aggs`、および 2026-08-08 に削除済みの `pivot_by`）は、複数行/VIN ソースの出力が `{source}__n_rows`
+だけになったことで上書きすべき対象が無くなったため、**設定項目そのものを撤廃する**。
+現行の `config/config.yaml`（`real_ingest:` セクション）にはまだ旧設計の
+`sources: {上塗ロボット: {aggs: [...]}, ...}` / `defaults: {aggs: [...]}` が残っているので、
+§11 T10 で削除すること。
+
+> 注意: `real_ingest.trend.aggs`（既定 `[mean]`）は**別物なので残す**。これは trend ワイド表の
+> rolling 窓集約の関数指定であり（§8.4(3)）、複数行/VIN ソースの集約とは無関係。
 
 ---
 
@@ -545,7 +690,9 @@ real_ingest:
 | 同一ソース内のヘッダ差異 | WARN＋レポート記録、継続 |
 | 列名正規化の衝突 | `__2` 付与＋WARN、継続 |
 | `merge(validate="one_to_one")` 違反 | 例外を捕まえず中断（設計前提の破れなので落とすべき） |
-| pivot 後の列数 > `max_columns_per_source` | `ValueError` で中断 |
+| size_bin の列数（config から確定）> `max_columns_per_source` | `ValueError` で中断（データ読取前に検査） |
+| `size_bin_width <= 0` / `size_bin_min >= size_bin_max` | `ValueError` で中断（設定ミス） |
+| `(size_bin_max - size_bin_min)` が `size_bin_width` の整数倍でない | `ValueError` で中断（境界とラベルが食い違うのを防ぐ。2026-08-28 追記） |
 | trend マッチ率 0 | `on_no_overlap` に従う（既定 WARN＋全 NaN 列） |
 | `0 <` trend マッチ率 `< min_match_rate` | WARN のみ |
 | `require_sources` のソースが 0 行 | `ValueError` で中断 |
@@ -595,6 +742,8 @@ real_ingest:
 - 内容: §8.1〜8.3、`reports/ingest_quality.csv` / `vin_panel_dictionary.csv` 出力。
 - 完了条件: パネルが約 1,300 行、`present__*` が 11 列、`defect_*` 列が全て `defect_` で始まる、
   ダミー行が除外されている、`validate="one_to_one"` を通る。
+  **2026-08-08 改定（D11）以降は defect 列が既定で `defect_上塗ブツ検__has` / `defect_電着ブツ検__has` の
+  2 列だけになる**（`__count` / `__kind__*` 等が残っていないことも確認する。§12.5）。
 
 ### T7: `assemble.py` — trend 時刻結合
 - 内容: §8.4、`reports/trend_anchor_map.csv` / `trend_join_report.csv` 出力。
@@ -603,10 +752,63 @@ real_ingest:
 
 ### T8: CLI・config・README
 - 内容: `cli.py` に `convert`（`--force`）/ `assemble`（`--date-from` / `--date-to`）を追加。
-  `config.yaml` に §9 を追記。README に実データ経路の章を追加し、旧経路を「合成データ用（廃止候補）」と明記、
-  p ≫ n の注意も記載。
-- 完了条件: `python main.py convert && python main.py assemble` が通る。
-  **`STAGES` / `ALL_ORDER` は未変更**で既存 89 テストが緑。
+  `config.yaml` に §9 を追記。README に実データ経路の章と p ≫ n の注意を記載。
+- 完了条件: `python main.py convert && python main.py assemble` が通り、既存テストが全て緑。
+  （当初の完了条件だった「`STAGES` / `ALL_ORDER` 未変更」は、旧経路と共にこれらの定数自体が
+  2026-08-05 に削除されたため**失効**。D1）
+
+### T9: defect の不良サイズ 0.1mm 刻み集計（追加・2026-08-07）
+- 対象: `src/defect_analysis/assemble.py`（`DEFAULT_DEFECT` / `prepare_defect_source()` /
+  `ingest_quality.csv` 出力箇所）、`config/config.yaml`（`real_ingest.defect`）。
+- 内容: §8.1.3-A。`size_bin_labels()`（config だけでラベル列を決める純関数）と
+  ビンカウント生成を追加し、`by_size_bin` が true のときだけ `{P}__has` の表に `join` する。
+  config 検査（幅・範囲・列数上限）は `prepare_defect_source()` の冒頭でデータ読取前に行う。
+  `ingest_quality.csv` に `size_bin:` 前置のビン一覧と `n_size_under` / `n_size_over` を追加する。
+- **既存挙動を変えないこと**: `by_size_bin` 既定 false のため、既定 config でのパネル列数・
+  `ingest_quality.csv` の既存列は不変であること（既存テストが緑のままであることで確認）。
+- 完了条件（**2026-08-08 の範囲変更後の数値に更新**）: §12.5 の size_bin 観点が全て緑。
+  実データで `by_size_bin: true` にして `assemble` を実行すると `defect_上塗ブツ検__size_bin__*` が
+  **22 列**（2 ソース合計 44 列）生成され、`n_size_over` が 上塗 1,691 / 電着 4,827、
+  `n_size_under` が両ソースとも 0（1日分・既定範囲 0.0〜2.0mm）になる。
+
+### T10: 複数行/VIN ソースの n_rows 化・defect 列の簡素化・size_bin 既定範囲変更（2026-08-08 / 2026-08-28 統合）
+
+> 2026-08-28 の変更（複数行/VIN ソースを `n_rows` のみにする）は、**T10 が未着手であり
+> 対象関数・対象 config セクションが完全に重複するため T10 に統合した**（`prepare_multi_row_source()` を
+> 2 回書き換えるのを避ける）。着手時は下記 1 の最終形だけを実装すればよく、
+> pivot 分岐や統計量集約を一度作る必要はない。
+
+- 対象: `src/defect_analysis/assemble.py`（`prepare_multi_row_source()` / `DEFAULT_SOURCE_DEFAULTS` /
+  `prepare_multi_row_source()` の呼び出し箇所 / `DEFAULT_DEFECT` /
+  `prepare_defect_source()` / `_zero_fill_after_merge` の呼び出し / `ingest_quality.csv` 出力箇所）、
+  `config/config.yaml`（`real_ingest.sources` / `real_ingest.defaults` を**セクションごと削除** / `real_ingest.defect`）、
+  `README.md`、影響する既存テスト（`tests/` の defect 列・pivot・複数行集約関連）。
+- 内容:
+  1. `prepare_multi_row_source()` を **`(df, source) -> pd.DataFrame` に変更し、
+     `groupby("vin").size()` を `{source}__n_rows` として返すだけ**にする（D5・§8.1.2）。
+     - `pivot_by` 引数・pivot 分岐（`_pivot_multi_row_source()`）・その列数ガードを削除。
+     - `aggs` 引数と、数値列 `mean/min/max/std` ・日時列 `min/max` ・文字列列 `nunique/first` の
+       集約コードを削除。**`time_column` の集約も行わない**（§8.4(2) のアンカーは 1行/VIN のみ）。
+     - `DEFAULT_SOURCE_DEFAULTS`（`{"aggs": [...], "pivot_by": []}`）と、その override を読む処理を削除。
+       `config.yaml` の `real_ingest.sources` / `real_ingest.defaults` も削除する（§9）。
+       **`real_ingest.trend.aggs` には手を触れない**（rolling 窓集約用で別物）。
+  2. `prepare_defect_source()` の出力を `{P}__has`（＋ `by_size_bin: true` のときだけ `__size_bin__*`）
+     のみにする。`__count` / `__size_*` / `__first_ts` / `__last_ts` / `__n_kind` / `__n_part` /
+     `__top_kind` / `__kind__*` / `__part__*` の生成コードと、`DEFAULT_DEFECT` の
+     `kind_column` / `part_column` / `time_column` / `by_kind` / `by_part` / `drop_columns` を削除（D11・§8.1.3）。
+  3. `DEFAULT_DEFECT` の `size_bin_min` を 0.0、`size_bin_max` を 2.0 に変更（§8.1.3-A）。
+  4. defect 側は 0 埋めしない現行挙動を維持（§13-7）。repair 側の 0 埋めには手を触れない。
+- 完了条件:
+  - 実データの `assemble` で、**上塗ロボット / 下塗ロボット / ホイ黒ロボット由来の列が
+    `上塗ロボット__n_rows` / `下塗ロボット__n_rows` / `ホイ黒ロボット__n_rows` の 3 列だけ**になる
+    （`__mean` / `__min` / `__max` / `__std` / `__nunique` / `__first` および
+    `{source}__{time_column}*` がこれらのソースの接頭辞で 1 つも存在しないこと）。
+  - `config/config.yaml` に `real_ingest.sources` / `real_ingest.defaults` が存在せず、
+    `real_ingest.trend.aggs` は残っていること。コード側にも `pivot_by` の文字列が残らないこと。
+  - 既定 config の `assemble` で defect 列が `defect_*__has` の 2 列のみ、
+    `by_size_bin: true` で 22 列/ソース追加。
+  - §12.5 の観点が全て緑、`.venv/bin/python -m pytest` が全て緑。
+  - パネル全体の列数が §8.5 の見込み（約 1,711 列）と大きく乖離しないこと（乖離時は §8.5 を実測で更新）。
 
 ---
 
@@ -648,9 +850,33 @@ trend 結合の正当性検証には期間が重複する fixture を自作す�
 
 ### 12.5 `assemble.py`
 - 1行/VIN ソースが `{source}__{col}` にプレフィクスされる。
-- 複数行/VIN ソースが `mean/min/max/std` と `n_rows` に集約される（3行 fixture で値を手計算検証）。
-- `pivot_by` 指定時に `{source}__{pivot値}__{col}` になり、`max_columns_per_source` 超過で `ValueError`。
-- defect: 種類別カウントが `crosstab` と一致、`検査箇所` が落ちる、列が全て `defect_` で始まる。
+- 複数行/VIN ソースは `{source}__n_rows`（行数）**のみ**を持つ。3行 fixture（数値列・日時列・
+  文字列列を含む）で、返る列が `vin` と `{source}__n_rows` だけであり値が 3 になること、
+  および `__mean` / `__min` / `__max` / `__std` / `__nunique` / `__first` を接尾に持つ列と
+  `{source}__{time_column}` が**一つも生成されない**ことを確認する（廃止列が存在しないことの確認テスト。D5）。
+- defect: 生成される列が `{P}__has`（＋ `by_size_bin: true` のときだけ `__size_bin__*`）のみで、
+  `__count` / `__size_mean`・`__size_max`・`__size_sum` / `__first_ts`・`__last_ts` /
+  `__n_kind`・`__n_part` / `__top_kind` / `__kind__*` / `__part__*` が**一つも生成されない**こと
+  （廃止列が存在しないことの確認テスト。D11）。列が全て `defect_` で始まること。
+- **defect の size_bin（§8.1.3-A）**: 以下を手計算できる小 fixture（1 VIN あたり 3〜5 行、
+  境界値 `-0.1 / 0.0 / 0.09 / 0.1 / 1.9 / 2.0 / 1462978.45` を含む）で検証する。
+  - 既定（`by_size_bin: false`）では `__size_bin__` 列が 1 つも生成されない。
+  - `by_size_bin: true` で生成列数が `round((max-min)/width) + 2` に**厳密一致**し、
+    fixture の値のレンジが変わっても列数・列名が変わらない（＝観測値に依存しない）。
+  - 半開区間: `0.1` は `0_0_0_1` ではなく `0_1_0_2` に入る。`0.0` は下限未満ビンに入らない
+    （`0_0_0_1` に入る）。`-0.1` は `0_0未満`、`2.0` と `1462978.45` は `2_0以上` に入る。
+  - 列名が `defect_{source}__size_bin__0_0_0_1` / `__size_bin__0_0未満` / `__size_bin__2_0以上` の形
+    （`.` と `-` が `_` になり、日本語が残る）。
+  - 1 VIN のビン列合計が、その VIN の `不良サイズ` 非 NaN 行数と一致する（`to_numeric` で NaN になる
+    文字列を 1 行混ぜて、どのビンにも入らないことを確認）。
+  - defect ソースに登場しない VIN では size_bin 列が **NaN のまま**（0 埋めされない。§13-7 と同じ扱い）。
+    登場する VIN で該当ビンが無い場合は 0。
+  - `size_bin_max - size_bin_min` を大きくして列数が `max_columns_per_source` を超える config で
+    `ValueError`。`size_bin_width: 0` / `size_bin_min >= size_bin_max` でも `ValueError`。
+  - `ingest_quality.csv` の `categories` に `size_bin:` 前置のビン一覧が入り、
+    `n_size_under` / `n_size_over` が fixture の件数と一致する。
+  - 浮動小数: `width=0.1` で `bin_min=0.0, bin_max=2.0` のとき、ラベルに `0_7000000000000001` 等が
+    現れない（整数インデックスで境界を作っていることの確認）。
 - 台帳が全ソースの VIN 和集合になり `present__*` が正しい（A のみの VIN / B のみの VIN を含む fixture）。
 - ダミー行が除外され、除外件数が `ingest_quality.csv` に記録される。
 - **trend 結合（期間が重複する自作 fixture）**: 1分グリッド 20 行 ＋ アンカー 2 件で、
@@ -665,9 +891,10 @@ trend 結合の正当性検証には期間が重複する fixture を自作す�
 パネル行数 > 1000、trend 列が存在し `trend_match_rate == 0`、レポート 5 種が生成されること。
 
 ### 12.7 既存テストへの回帰条件
-`cli.STAGES` / `ALL_ORDER` を変更しないので、既存 89 本
-（`tests/test_transforms.py::test_ingest_writes_all_interim_tables` を含む）は無改修で緑であること。
-**これを本タスクの回帰条件とする。**
+~~`cli.STAGES` / `ALL_ORDER` を変更しないので、既存 89 本は無改修で緑であること。~~
+→ **2026-08-05 失効**。旧経路（`ingest`/`integrate`/`features`）と `STAGES` / `ALL_ORDER` /
+`run_pipeline()` は削除され、旧経路専用テスト（`tests/test_ingest_rename.py` ほか）も同時に削除された。
+現在の回帰条件は「`.venv/bin/python -m pytest` が全て緑（2026-08-07 時点 186 本）」であること。
 
 ---
 
@@ -690,13 +917,30 @@ trend 結合の正当性検証には期間が重複する fixture を自作す�
 4. **`閾値判定ﾌﾗｸﾞ` / `判定結果_3Bit` の値の意味**（実測値に `2` がある。OK/NG ではない）。
    → 数値としてそのまま持つ。フラグ解釈は行わない。
 5. **上塗ロボットの測定値 0 の意味**（当該ロボットが塗装していない＝欠測 か、実測 0 か）。
-   → 現設計は 0 を実測値として mean に含める。`n_rows` を併記して後から判断できるようにする。
+   ~~→ 現設計は 0 を実測値として mean に含める。`n_rows` を併記して後から判断できるようにする。~~
+   → **2026-08-28 更新（D5）**: 複数行/VIN ソースの数値列集約（mean を含む）を全廃したため、
+   「0 を mean に含めるか」という論点は成立しなくなった。パネルに入るのは `{source}__n_rows` のみで、
+   測定値そのものが列として存在しない。**業務上の疑問（0 の意味）は未確定のまま残るが、
+   本設計書のスコープでは対応不要**になった（§14 の未回答 2 は引き続き要回答）。
+   将来 0 の意味が判明して測定値をパネルに入れたくなった場合は、レイク（`data/lake/`）に
+   生データが可逆に残っているので、`assemble` 側の変更だけで再取得できる（再変換は不要。§3）。
 6. **不良の「重大度」定義** — 実データに `severity` は無い。`不良サイズ` が代替になり得るが閾値は不明。
-   → 本書では閾値を設けず統計量のみ出す。
+   → 本書では閾値を設けない。**2026-08-07 追記**: 閾値を決めずに分布そのものを持てるよう、
+   opt-in の 0.1mm 刻みカウント列（§8.1.3-A）を追加した。閾値が判明した場合はこのビン列の
+   足し合わせで再現できるため、設計変更は不要。**2026-08-08 追記**: D11 でサイズ統計量列
+   （`__size_mean` / `__size_max` / `__size_sum`）を廃止したため、パネル上のサイズ情報は
+   この opt-in のビン列だけになった（既定では `{P}__has` のみでサイズ情報は無い）。
+   既定範囲は 0.0〜2.0mm なので、閾値が 2.0mm を超える場合は `size_bin_max` の引き上げが必要になる。
+   なお電着ブツ検には max = 1,462,978.45mm という
+   明らかな異常値があり、**`不良サイズ` をそのまま重大度指標に使う前にデータ品質の確認が必要**
+   （§14 の未回答 3 に関連）。
 7. **【確定・2026-07-31】ブツ検に行が無い VIN の意味** — ユーザー判断により「未検査」と確定。
-   `assemble.py` を改修し、`defect_{source}__count`/`__has`/`__kind__*`/`__part__*` は
-   defect ソースに一切登場しない VIN では **0 埋めせず NaN のまま**残すよう変更した
-   （その VIN が defect ソースに登場するが特定の種類が無いだけの場合の 0 埋めは従来どおり）。
+   `assemble.py` を改修し、defect 由来の列は defect ソースに一切登場しない VIN では
+   **0 埋めせず NaN のまま**残すよう変更した（その VIN が defect ソースに登場するが該当ビンが
+   無いだけの場合に 0 を入れるのは従来どおり）。
+   **2026-08-08 更新（D11）**: 対象列は `defect_{source}__has` と、opt-in 時の
+   `defect_{source}__size_bin__*` のみになった（`__count` / `__kind__*` / `__part__*` は列自体を廃止）。
+   `__has` は「1 = そのソースで検査され不良が記録された」「NaN = 未検査」を表す。
 
 ---
 

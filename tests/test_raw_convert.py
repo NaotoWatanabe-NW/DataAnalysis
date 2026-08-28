@@ -228,6 +228,59 @@ class ConvertFileTest(unittest.TestCase):
         self.assertTrue(any(unknown_dir.glob("*.parquet")))
         self.assertTrue(any("date=unknown" in msg for msg in cm.output))
 
+    def test_datetime_without_seconds_is_parsed_via_fallback_format_without_warning(self):
+        # 実データでは通過イベント系（秒あり）とセンサー/PLC系（秒なし）が混在する
+        # （docs/real_data_facts.md 参照）。既定の datetime_format_fallbacks（コード側 DEFAULT_CONVERT）
+        # が秒なし側を吸収し、失敗率の WARN を出さないことを確認する。
+        self._write_csv(
+            pd.DataFrame(
+                {
+                    "VIN#": ["A", "B"],
+                    "通過日時": ["2026/1/2 16:35", "2026/07/24 06:00:00"],
+                    "値": [1.0, 2.0],
+                }
+            )
+        )
+        source = _make_source([self.raw_csv], ["VIN", "通過日時", "値"])
+        cfg = _make_cfg(self.root)
+        lake_dir = self.root / "lake"
+
+        with self.assertNoLogs("defect_analysis.raw_convert", level="WARNING"):
+            convert_file(self.raw_csv, source, lake_dir, cfg)
+
+        result = read_source(lake_dir, "traceability", "テスト")
+        parsed = result.set_index("vin")["通過日時"]
+        self.assertEqual(parsed.loc["A"], pd.Timestamp("2026-01-02 16:35:00"))
+        self.assertEqual(parsed.loc["B"], pd.Timestamp("2026-07-24 06:00:00"))
+        # 秒あり行・秒なし行（片方は主フォーマットが全滅せず一部成功、他方は全滅からの
+        # フォールバック）が混在しても、書き出し後の dtype 解像度が揃っていること
+        # （揃わないと後段の merge_asof が例外を投げる。実装レビューで発見した回帰）。
+        self.assertEqual(str(result["通過日時"].dtype), "datetime64[us]")
+
+    def test_datetime_fully_without_seconds_falls_back_for_the_whole_column(self):
+        # 主フォーマットが「全行」失敗するケース（ブース・trend 等の実データで実際に起きる）。
+        # 全滅時 pandas は解像度を datetime64[s] と推定するため、フォールバック結果への
+        # 昇格が正しく行われるかを別途確認する。
+        self._write_csv(
+            pd.DataFrame(
+                {
+                    "VIN#": ["A", "B"],
+                    "通過日時": ["2026/1/2 16:35", "2026/1/4 14:41"],
+                    "値": [1.0, 2.0],
+                }
+            )
+        )
+        source = _make_source([self.raw_csv], ["VIN", "通過日時", "値"])
+        cfg = _make_cfg(self.root)
+        lake_dir = self.root / "lake"
+
+        with self.assertNoLogs("defect_analysis.raw_convert", level="WARNING"):
+            convert_file(self.raw_csv, source, lake_dir, cfg)
+
+        result = read_source(lake_dir, "traceability", "テスト")
+        self.assertEqual(str(result["通過日時"].dtype), "datetime64[us]")
+        self.assertFalse(result["通過日時"].isna().any())
+
 
 def _repair_by_kind(**pii_overrides) -> dict:
     """DEFAULT_CONVERT_BY_KIND_PREPROCESS["repair"] を土台に pii だけ上書きする。

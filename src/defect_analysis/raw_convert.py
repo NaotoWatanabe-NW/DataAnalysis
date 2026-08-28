@@ -56,6 +56,10 @@ DEFAULT_CONVERT_BY_KIND_PREPROCESS = {
 DEFAULT_CONVERT = {
     "encoding": "utf-8-sig",
     "datetime_format": "%Y/%m/%d %H:%M:%S",
+    # 主フォーマットで失敗した値だけ順に再トライする（§7.2）。実データでは秒あり（VIN通過・検査系）と
+    # 秒なし（ブース・ロボット・trend のセンサー/PLC系）が混在するため、秒なし側をコード既定に持つ
+    # （smoke テストは config.yaml を読まないため、実データの特性は DEFAULT_* 側に必要。§6.5 と同じ理由）。
+    "datetime_format_fallbacks": ["%Y/%m/%d %H:%M"],
     "chunksize": 200_000,
     "downcast_float": True,
     "keep_float64_suffixes": ["積算値", "総合計"],
@@ -126,10 +130,32 @@ def _kind_convert_config(convert_cfg: dict, kind: str) -> dict:
 def _parse_datetime_with_warning(
     chunk: pd.DataFrame, column: str, fmt: str, *,
     kind: str, name: str, chunk_idx: int, file_name: str, max_failure_rate: float,
+    fallback_formats: Sequence[str] = (),
 ) -> pd.Series:
-    """日時パースし、既存 NA を除いた失敗率が閾値超過なら WARN する（keyword 方式と repair 方式で共通化）。"""
+    """日時パースし、既存 NA を除いた失敗率が閾値超過なら WARN する（keyword 方式と repair 方式で共通化）。
+
+    主フォーマット（`fmt`）で失敗した値だけ、`fallback_formats` を順に再トライして埋める
+    （`encoding_fallbacks` と同じ「主優先・フォールバックは失敗分のみ」という発想。§7.2）。
+    実データでは、通過イベント系（VIN 通過・検査）は秒あり、センサー/PLC 系
+    （ブース・ロボット・trend）は秒なしのように、**ソースによって精度が異なる**ことがあるため
+    単一フォーマットでは両立できない（実測・2026-08-28。docs/real_data_facts.md 参照）。
+    """
     orig_na = chunk[column].isna()
     parsed = pd.to_datetime(chunk[column], format=fmt, errors="coerce")
+    # 主フォーマットが全滅すると pandas は解像度を datetime64[s] と推定し、フォールバックが
+    # 実際に返す datetime64[us] と食い違う。列間で解像度が揃わないと、後段の merge_asof
+    # （assemble.py の trend 結合）が "incompatible merge keys" で例外を投げるため、
+    # 実データに含まれる時刻は全て秒精度以下なので us に統一する（実測・2026-08-28）。
+    parsed = parsed.dt.as_unit("us")
+
+    remaining = parsed.isna() & ~orig_na
+    for fallback_fmt in fallback_formats:
+        if not remaining.any():
+            break
+        retried = pd.to_datetime(chunk.loc[remaining, column], format=fallback_fmt, errors="coerce")
+        parsed.loc[remaining] = retried.dt.as_unit("us")
+        remaining = parsed.isna() & ~orig_na
+
     newly_failed = parsed.isna() & ~orig_na
     fail_rate = float(newly_failed.mean()) if len(chunk) else 0.0
     if fail_rate > max_failure_rate:
@@ -305,6 +331,7 @@ def convert_file(
     encoding = source.encoding
     chunksize = int(convert_cfg["chunksize"])
     datetime_format = convert_cfg["datetime_format"]
+    datetime_format_fallbacks = list(convert_cfg["datetime_format_fallbacks"])
     downcast_float = bool(convert_cfg["downcast_float"])
     keep_float64_suffixes = tuple(convert_cfg["keep_float64_suffixes"])
     datetime_keywords = convert_cfg["datetime_column_keywords"]
@@ -350,6 +377,7 @@ def convert_file(
                 chunk[c] = _parse_datetime_with_warning(
                     chunk, c, datetime_format, kind=kind, name=name, chunk_idx=chunk_idx,
                     file_name=path.name, max_failure_rate=max_failure_rate,
+                    fallback_formats=datetime_format_fallbacks,
                 )
 
             if source.vin_column and source.vin_column in chunk.columns:

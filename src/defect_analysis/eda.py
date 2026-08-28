@@ -346,41 +346,6 @@ def _fig_daily_trend(df: pd.DataFrame, target: str, out: Path, meta: AnnotationM
     return _save(fig, out, footnote)
 
 
-def _defect_kind_groups(df: pd.DataFrame) -> dict[str, list[str]]:
-    """`defect_{source}__kind__{種類}` 列を検査工程（source）別にグルーピングする。"""
-    groups: dict[str, list[str]] = {}
-    for col in df.columns:
-        if "__kind__" not in col or not col.startswith("defect_"):
-            continue
-        source = col[len("defect_"):].split("__kind__")[0]
-        groups.setdefault(source, []).append(col)
-    return {k: sorted(v) for k, v in sorted(groups.items())}
-
-
-def _fig_defect_category_breakdown(df: pd.DataFrame, out: Path, meta: AnnotationMeta) -> str | None:
-    groups = _defect_kind_groups(df)
-    if not groups:
-        logger.warning("不良種類別カウント列が見つからないため、不良カテゴリ内訳の図をスキップします。")
-        return None
-
-    n = len(groups)
-    fig, axes = plt.subplots(1, n, figsize=(6 * n, 5.5))
-    axes = np.atleast_1d(axes)
-    for ax, (source, cols) in zip(axes, groups.items()):
-        totals = df[cols].sum().sort_values(ascending=False)
-        totals.index = [c.split("__kind__", 1)[-1] for c in totals.index]
-        colors = [vs.color_for(i) for i in range(len(totals))]
-        ax.bar(totals.index, totals.values, color=colors, width=0.6, zorder=3)
-        for x, v in enumerate(totals.values):
-            ax.text(x, v, f"{int(v)}", ha="center", va="bottom", fontsize=10, color=vs.INK_SECONDARY)
-        ax.set_title(f"{source}")
-        ax.set_ylabel("不良件数")
-    fig.suptitle("不良カテゴリ別 件数（検査工程別。未検査 VIN は集計対象外）", fontsize=13, fontweight="bold")
-    fig.tight_layout(rect=(0, 0.04, 1, 0.94))
-    footnote = meta.footnote(data_kind="不良カテゴリ内訳")
-    return _save(fig, out, footnote)
-
-
 def _cap_group_columns(
     df: pd.DataFrame, groups: dict[str, list[str]], max_n: int, *, chart: str
 ) -> dict[str, list[str]]:
@@ -844,9 +809,6 @@ def run_eda(cfg: Config) -> dict:
     if fig:
         figures.append(fig)
     fig = _fig_daily_trend(df, target, out_dir / "06_daily_trend.png", meta)
-    if fig:
-        figures.append(fig)
-    fig = _fig_defect_category_breakdown(df, out_dir / "07_defect_category_breakdown.png", meta)
     if fig:
         figures.append(fig)
 

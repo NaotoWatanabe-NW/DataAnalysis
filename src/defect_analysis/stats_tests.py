@@ -1,7 +1,7 @@
 """ステップ5: 統計手法で相関・群間差を判定する（実データパネルが対象）。
 
 目的変数（analysis.targets。既定は classification=[has_repair_record],
-regression=[defect_*__count 等]）に対して、工程系の説明変数それぞれの関連を
+regression=[repair_修正__count 等]）に対して、工程系の説明変数それぞれの関連を
 単変量検定で評価する。多重比較は BH-FDR で補正。
 
   数値 × 2群       : Welch t 検定 / Mann-Whitney U（効果量 Cohen's d / 順位二列相関）

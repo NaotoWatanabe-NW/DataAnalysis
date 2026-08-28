@@ -6,6 +6,7 @@
 実データ（`data/raw` 配下の CSV）を `convert` → `assemble` で VIN 単位のパネル
 （`data/interim/vin_panel.parquet`）にまとめ、`eda` / `stats` / `ml` で分析する。
 詳細設計は [docs/real_data_ingest_design.md](docs/real_data_ingest_design.md)。
+最近の変更は [CHANGELOG.md](CHANGELOG.md) を参照してください。
 
 ## データモデル（VIN 基数）
 
@@ -249,9 +250,11 @@ VIN）を扱う場合は `--date-from`/`--date-to` と `real_ingest.trend.includ
 | `reports/trend_join_report.csv` | アンカー別の trend マッチ率と期間 |
 
 > **ブツ検にレコードが無い VIN の扱い（確定・2026-07-31）**: 「不良ゼロ」ではなく「未検査」として扱う。
-> `defect_{source}__count` / `__has` / `__kind__*` / `__part__*` は、その VIN が defect ソースに
-> 一切登場しない場合は **0 埋めせず NaN のまま**残す（`prepare_defect_source` 内で「その VIN は
-> 登場するが特定の種類が無い」場合の 0 埋めは従来どおり行う。区別されるのは「登場すらしない」場合のみ）。
+> defect ソースの出力列は `defect_{source}__has`（存在フラグ。1 = そのソースに登場した）1 列のみ
+> （2026-08-08 の D11 で `__count`/`__kind__*`/`__part__*` 等は全廃済み）。その VIN が defect ソースに
+> 一切登場しない場合は **0 埋めせず NaN のまま**残す（`__has` は「登場した」ことしか表さないため、
+> 登場しない = 未検査を「1」以外の値=NaNで表現する。`by_size_bin: true` 時の
+> `defect_{source}__size_bin__*` も同様に 0 埋めしない）。
 >
 > **`has_repair_record` 列**: `assemble` は全ての `repair_*__has` 列（複数 repair ソースがあれば
 > それらの OR）から VIN 単位の修正記録有無フラグ `has_repair_record`（0/1, int）をパネルに追加する。
@@ -262,8 +265,11 @@ VIN）を扱う場合は `--date-from`/`--date-to` と `real_ingest.trend.includ
 
 - `real_ingest.vin.suffix_policy`: VIN サフィックス（`a`/`b`/`c`。同一車体の2回目以降の通過を意味する
   ことが確認済み）の扱い。`keep`（既定・別キー） | `merge`（`vin_base` に丸める）
-- `real_ingest.sources` / `defaults`: 複数行/VIN ソース（自動判定・宣言不要）の集約方法（`aggs`）・pivot 列（`pivot_by`）。`sources` は defaults と異なる挙動にしたいソースのみ上書き記入する
-- `real_ingest.defect`: 不良サイズ/種類/検査部位の列名、種類別カウント列を作るか（`by_kind`）
+- 複数行/VIN ソース（上塗/下塗/ホイ黒ロボット。自動判定・宣言不要）は `{source}__n_rows`（行数）のみを
+  出力するため、対応する config セクションは無い（統計量集約・pivot は全廃済み）
+- `real_ingest.defect`: `size_column`（不良サイズの列名。`by_size_bin` 有効時のみ使用）、
+  `by_size_bin`（0.1mm 刻みのビンカウント列 `{source}__size_bin__*` を作るか。既定 off）、
+  `size_bin_min` / `size_bin_max` / `size_bin_width`（ビン範囲・幅[mm]。固定値でのみ指定可能）
 - `real_ingest.repair`: repair（修正実績）の VIN 集約設定。`time_column`（`修正日時`）/
   `production_time_column`（`PB_ON`。date パーティションのアンカーと同じ）/ `workload_column`（`修正工数`）/
   `category_columns`（列ごとにカウント展開するか。既定は `大分類` のみ）/ `worker_column`（`修正員_id`）/

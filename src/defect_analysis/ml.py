@@ -1,7 +1,7 @@
 """ステップ6: 機械学習で予測性能を判定する（主軸: LightGBM。実データパネルが対象）。
 
 工程系の説明変数のみ（リーク列除外）から、analysis.targets（既定は
-classification=[has_repair_record], regression=[defect_*__count 等]）を予測する。
+classification=[has_repair_record], regression=[repair_修正__count 等]）を予測する。
 ベースライン→木モデル→LightGBM の順で交差検証比較し、LightGBM で保持テストの評価図と
 特徴量重要度（gain / permutation）を出力する。p ≫ n（説明変数が数百〜千に対し行数は
 千数百）であるため、過学習・不安定な重要度に注意（README 参照）。
@@ -252,7 +252,7 @@ def run_ml(cfg: Config) -> dict:
     for task, target in tasks:
         if target not in df.columns:
             continue
-        # 目的変数が NaN の行（例: defect_*__count は「未検査」で NaN）は学習対象から除外する。
+        # 目的変数が NaN の行（例: defect_*__has は「未検査」で NaN）は学習対象から除外する。
         # 0 埋めしていない設計（docs/real_data_ingest_design.md §13-7）なので、ここで落とさないと
         # scikit-learn が「y に NaN がある」で例外を投げる。
         target_df = df[df[target].notna()]

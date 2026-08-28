@@ -26,15 +26,12 @@ DEFAULT_RAW_DIR = "data/raw"
 DEFAULT_LAKE_DIR = "data/lake"
 DEFAULT_PANEL_PATH = "data/interim/vin_panel.parquet"
 
-DEFAULT_SOURCE_DEFAULTS = {"aggs": ["mean", "min", "max", "std"], "pivot_by": []}
 DEFAULT_DEFECT = {
     "size_column": "不良サイズ",
-    "kind_column": "不良種類",
-    "part_column": "検査部位",
-    "time_column": "入口_通過日時",
-    "by_kind": True,
-    "by_part": False,
-    "drop_columns": ["検査箇所"],
+    "by_size_bin": False,
+    "size_bin_width": 0.1,
+    "size_bin_min": 0.0,
+    "size_bin_max": 2.0,
 }
 DEFAULT_REPAIR = {
     "time_column": "修正日時",
@@ -91,15 +88,6 @@ def _traceability_defect_read_columns(source: RawSource) -> list[str]:
     """
     base_cols = [c for c in source.columns if c != source.vin_column]
     return [*base_cols, "vin", "vin_base", "vin_pass_no", "vin_is_dummy"]
-
-
-def _source_override(cfg: Config, name: str) -> dict:
-    defaults = dict(DEFAULT_SOURCE_DEFAULTS)
-    defaults.update(cfg.get("real_ingest.defaults", {}) or {})
-    override = dict(defaults)
-    sources_cfg = cfg.get("real_ingest.sources", {}) or {}
-    override.update(sources_cfg.get(name, {}) or {})
-    return override
 
 
 def _defect_config(cfg: Config) -> dict:
@@ -159,136 +147,133 @@ def prepare_single_row_source(df: pd.DataFrame, source: str) -> pd.DataFrame:
     return work.rename(columns=rename_map)
 
 
-def prepare_multi_row_source(
-    df: pd.DataFrame,
-    source: str,
-    aggs: list[str],
-    pivot_by: list[str] | None = None,
-    *,
-    max_columns_per_source: int = 200,
-) -> pd.DataFrame:
-    """複数行/VIN ソースを集約する（既定は統計量、`pivot_by` 指定時は pivot）。"""
-    drop_cols = [c for c in _DROP_ALWAYS if c in df.columns]
-    work = df.drop(columns=drop_cols)
-    pivot_by = pivot_by or []
+def prepare_multi_row_source(df: pd.DataFrame, source: str) -> pd.DataFrame:
+    """複数行/VIN ソースを `{source}__n_rows`（行数）1 列だけに集約する（D5・§8.1.2）。
 
-    if pivot_by:
-        return _pivot_multi_row_source(work, source, pivot_by, max_columns_per_source)
-
-    other_cols = [c for c in work.columns if c != "vin"]
-    numeric_cols = [c for c in other_cols if pd.api.types.is_numeric_dtype(work[c])]
-    datetime_cols = [c for c in other_cols if pd.api.types.is_datetime64_any_dtype(work[c])]
-    string_cols = [c for c in other_cols if c not in numeric_cols and c not in datetime_cols]
-
-    grouped = work.groupby("vin")
-    frames: list[pd.DataFrame] = []
-
-    if numeric_cols:
-        agg_df = grouped[numeric_cols].agg(aggs)
-        agg_df.columns = [prefixed(source, f"{col}__{agg}") for col, agg in agg_df.columns]
-        frames.append(agg_df)
-
-    if datetime_cols:
-        dt_df = grouped[datetime_cols].agg(["min", "max"])
-        dt_df.columns = [prefixed(source, f"{col}__{agg}") for col, agg in dt_df.columns]
-        frames.append(dt_df)
-
-    if string_cols:
-        nunique_df = grouped[string_cols].nunique()
-        nunique_df.columns = [prefixed(source, f"{col}__nunique") for col in nunique_df.columns]
-        first_df = grouped[string_cols].first()
-        first_df.columns = [prefixed(source, f"{col}__first") for col in first_df.columns]
-        frames.append(nunique_df)
-        frames.append(first_df)
-
-    frames.append(grouped.size().rename(prefixed(source, "n_rows")))
-
-    result = pd.concat(frames, axis=1).reset_index()
-    return result
+    数値列・日時列・文字列列に対する統計量集約、設備別 pivot は一切行わない
+    （2026-08-28 改定。したがって `time_column` もパネルに残らず、複数行/VIN ソースは
+    trend アンカーになり得ない。§8.4(2)）。
+    """
+    work = df[["vin"]]
+    n_rows = work.groupby("vin").size().rename(prefixed(source, "n_rows"))
+    return n_rows.reset_index()
 
 
-def _pivot_multi_row_source(
-    work: pd.DataFrame, source: str, pivot_by: list[str], max_columns_per_source: int
-) -> pd.DataFrame:
-    other_cols = [c for c in work.columns if c != "vin" and c not in pivot_by]
-    numeric_cols = [c for c in other_cols if pd.api.types.is_numeric_dtype(work[c])]
-    if not numeric_cols:
-        return work[["vin"]].drop_duplicates().reset_index(drop=True)
+def _decimal_places(width: float) -> int:
+    """`width` の小数桁数を返す（`size_bin_labels` の固定小数点表記に使う）。"""
+    text = f"{width:.10f}".rstrip("0")
+    if "." not in text:
+        return 0
+    return len(text.split(".")[-1])
 
-    pivot_work = work.copy()
-    for col in pivot_by:
-        pivot_work[col] = pivot_work[col].map(
-            lambda v: normalize_name(str(v)) if pd.notna(v) else v
-        )
 
-    pivoted = pd.pivot_table(
-        pivot_work, index="vin", columns=pivot_by, values=numeric_cols, aggfunc="mean"
-    )
-    # pivoted.columns: MultiIndex (value_col, pivot_val...) -> 順序を (pivot_val..., value_col) に入替える
-    new_columns = []
-    for col_tuple in pivoted.columns:
-        value_col, *pivot_vals = col_tuple
-        new_columns.append(prefixed(source, "__".join([*[str(v) for v in pivot_vals], value_col])))
-    pivoted.columns = new_columns
+def size_bin_labels(bin_min: float, bin_max: float, bin_width: float) -> list[str]:
+    """ビン列のラベル（正規化前）を昇順で返す。データを見ずに config だけで決まる（§8.1.3-A）。
 
-    if pivoted.shape[1] > max_columns_per_source:
+    戻り値の先頭は下限未満ビン（`{bin_min}未満`）、末尾は上限以上ビン（`{bin_max}以上`）。
+    浮動小数の丸め誤差を避けるため、境界は `bin_width` の小数桁数から決めた整数インデックスで
+    生成し、最後に固定小数点表記に戻す。
+    """
+    if bin_width <= 0:
+        raise ValueError(f"size_bin_width は正の値である必要があります: {bin_width}")
+    if bin_min >= bin_max:
+        raise ValueError(f"size_bin_min は size_bin_max 未満である必要があります: min={bin_min}, max={bin_max}")
+
+    decimals = _decimal_places(bin_width)
+    scale = 10 ** decimals
+    min_idx = round(bin_min * scale)
+    max_idx = round(bin_max * scale)
+    width_idx = round(bin_width * scale)
+
+    if (max_idx - min_idx) % width_idx != 0:
         raise ValueError(
-            f"[traceability/{source}] pivot 後の列数が上限を超えました: "
-            f"{pivoted.shape[1]} > max_columns_per_source={max_columns_per_source}"
+            "size_bin_width が範囲を割り切れません: "
+            f"(size_bin_max - size_bin_min)={bin_max - bin_min} は "
+            f"size_bin_width={bin_width} の整数倍ではありません"
         )
 
-    return pivoted.reset_index()
+    labels = [f"{bin_min:.{decimals}f}未満"]
+    idx = min_idx
+    while idx < max_idx:
+        lo = idx / scale
+        hi = (idx + width_idx) / scale
+        labels.append(f"{lo:.{decimals}f}-{hi:.{decimals}f}")
+        idx += width_idx
+    labels.append(f"{bin_max:.{decimals}f}以上")
+    return labels
+
+
+def prepare_defect_size_bins(
+    size_numeric: pd.Series, vin: pd.Series, prefix: str, cfg_defect: dict
+) -> pd.DataFrame:
+    """VIN × ビンのカウント表を返す（§8.1.3-A）。
+
+    `prepare_defect_source()` から呼び、`{P}__has` の表に `result.join(..., how="left")` で連結する。
+    集計対象は非 NaN の `size_numeric` のみ。そのソースに登場する VIN については該当が無いビンにも
+    0 を入れる（台帳結合後の 0 埋めとは別。§13-7 の対象外）。
+    """
+    bin_min = float(cfg_defect["size_bin_min"])
+    bin_max = float(cfg_defect["size_bin_max"])
+    bin_width = float(cfg_defect["size_bin_width"])
+    labels = size_bin_labels(bin_min, bin_max, bin_width)
+
+    decimals = _decimal_places(bin_width)
+    scale = 10 ** decimals
+    min_idx = round(bin_min * scale)
+    max_idx = round(bin_max * scale)
+    width_idx = round(bin_width * scale)
+
+    edges: list[float] = [-np.inf, bin_min]
+    idx = min_idx
+    while idx < max_idx:
+        idx += width_idx
+        edges.append(idx / scale)
+    edges.append(np.inf)
+
+    valid_mask = size_numeric.notna()
+    binned = pd.cut(size_numeric[valid_mask], bins=edges, right=False, labels=labels)
+    ct = pd.crosstab(vin[valid_mask], binned, dropna=False)
+    # そのソースに登場する VIN は、不良サイズが全行 NaN でもビン列を持つ（0 埋め）。
+    # crosstab の index は valid_mask で絞った VIN に限られるため、全 VIN で reindex する。
+    all_vins = pd.Index(vin.unique(), name="vin")
+    ct = ct.reindex(index=all_vins, columns=labels, fill_value=0)
+    ct.columns = [prefixed(prefix, f"size_bin__{normalize_name(label)}") for label in ct.columns]
+    return ct
 
 
 def prepare_defect_source(df: pd.DataFrame, source: str, cfg: Config) -> pd.DataFrame:
-    """defect ソースを VIN 単位に集約する（列は必ず `defect_` で始める。D9）。"""
+    """defect ソースを VIN 単位に集約する。出力列は `{P}__has` のみ（P = `defect_{source}`。D9・D11）。
+
+    サイズ分布が必要な場合のみ `by_size_bin` で `{P}__size_bin__*` を追加する（§8.1.3-A）。
+    config 検証（幅・範囲・列数上限）はデータに対する処理を始める前に行う。
+    """
     defect_cfg = _defect_config(cfg)
     prefix = f"defect_{source}"
 
-    drop_cols = [c for c in defect_cfg["drop_columns"] if c in df.columns]
-    drop_cols += [c for c in _DROP_ALWAYS if c in df.columns]
+    if defect_cfg["by_size_bin"]:
+        bin_min = float(defect_cfg["size_bin_min"])
+        bin_max = float(defect_cfg["size_bin_max"])
+        bin_width = float(defect_cfg["size_bin_width"])
+        labels = size_bin_labels(bin_min, bin_max, bin_width)  # 幅・範囲の設定ミスもここで検知する
+        max_columns = int(_assemble_config(cfg)["max_columns_per_source"])
+        if len(labels) > max_columns:
+            raise ValueError(
+                f"[defect/{source}] size_bin の列数が上限を超えました: "
+                f"{len(labels)} > max_columns_per_source={max_columns}"
+            )
+
+    drop_cols = [c for c in _DROP_ALWAYS if c in df.columns]
     work = df.drop(columns=drop_cols)
 
-    size_col = defect_cfg["size_column"]
-    kind_col = defect_cfg["kind_column"]
-    part_col = defect_cfg["part_column"]
-    time_col = defect_cfg["time_column"]
-
     grouped = work.groupby("vin")
-    result = grouped.size().rename(f"{prefix}__count").to_frame()
-    result[f"{prefix}__has"] = 1
+    has = pd.Series(1, index=grouped.size().index, name=f"{prefix}__has")
+    result = has.to_frame()
 
-    if size_col in work.columns:
+    if defect_cfg["by_size_bin"]:
+        size_col = defect_cfg["size_column"]
         size_numeric = pd.to_numeric(work[size_col], errors="coerce")
-        size_stats = size_numeric.groupby(work["vin"]).agg(["mean", "max", "sum"])
-        size_stats.columns = [f"{prefix}__size_{agg}" for agg in size_stats.columns]
-        result = result.join(size_stats)
-
-    if time_col in work.columns:
-        ts_stats = grouped[time_col].agg(["min", "max"])
-        ts_stats.columns = [f"{prefix}__first_ts", f"{prefix}__last_ts"]
-        result = result.join(ts_stats)
-
-    if kind_col in work.columns:
-        result[f"{prefix}__n_kind"] = grouped[kind_col].nunique()
-        result[f"{prefix}__top_kind"] = grouped[kind_col].agg(_top_value)
-        if defect_cfg["by_kind"]:
-            normalized_kind = work[kind_col].map(lambda v: normalize_name(str(v)) if pd.notna(v) else v)
-            ct = pd.crosstab(work["vin"], normalized_kind)
-            ct.columns = [f"{prefix}__kind__{k}" for k in ct.columns]
-            result = result.join(ct, how="left")
-            for c in ct.columns:
-                result[c] = result[c].fillna(0).astype(int)
-
-    if part_col in work.columns:
-        result[f"{prefix}__n_part"] = grouped[part_col].nunique()
-        if defect_cfg["by_part"]:
-            normalized_part = work[part_col].map(lambda v: normalize_name(str(v)) if pd.notna(v) else v)
-            ct = pd.crosstab(work["vin"], normalized_part)
-            ct.columns = [f"{prefix}__part__{k}" for k in ct.columns]
-            result = result.join(ct, how="left")
-            for c in ct.columns:
-                result[c] = result[c].fillna(0).astype(int)
+        bins = prepare_defect_size_bins(size_numeric, work["vin"], prefix, defect_cfg)
+        result = result.join(bins, how="left")
 
     return result.reset_index()
 
@@ -834,12 +819,21 @@ def assemble(cfg: Config, *, date_from: str | None = None, date_to: str | None =
         n_vin = int(clean_df["vin"].nunique())
         categories = ""
         n_vin_not_in_ledger: int | None = None
+        n_size_under: int | None = None
+        n_size_over: int | None = None
 
         if source.kind == "defect":
             prepared = prepare_defect_source(clean_df, source.name, cfg)
             n_duplicate = 0
-            kind_prefix = f"defect_{source.name}__kind__"
-            categories = ";".join(sorted(c[len(kind_prefix):] for c in prepared.columns if c.startswith(kind_prefix)))
+            defect_cfg = _defect_config(cfg)
+            if defect_cfg["by_size_bin"]:
+                bin_min = float(defect_cfg["size_bin_min"])
+                bin_max = float(defect_cfg["size_bin_max"])
+                labels = size_bin_labels(bin_min, bin_max, float(defect_cfg["size_bin_width"]))
+                categories = ";".join(f"size_bin:{normalize_name(label)}" for label in labels)
+                size_numeric = pd.to_numeric(clean_df[defect_cfg["size_column"]], errors="coerce").dropna()
+                n_size_under = int((size_numeric < bin_min).sum())
+                n_size_over = int((size_numeric >= bin_max).sum())
         elif source.kind == "repair":
             prepared = prepare_repair_source(clean_df, source.name, cfg)
             n_duplicate = 0
@@ -855,11 +849,7 @@ def assemble(cfg: Config, *, date_from: str | None = None, date_to: str | None =
         else:
             is_multi = bool(clean_df["vin"].duplicated().any())
             if is_multi:
-                override = _source_override(cfg, source.name)
-                prepared = prepare_multi_row_source(
-                    clean_df, source.name, override["aggs"], override["pivot_by"],
-                    max_columns_per_source=int(assemble_cfg["max_columns_per_source"]),
-                )
+                prepared = prepare_multi_row_source(clean_df, source.name)
                 n_duplicate = 0
             else:
                 n_duplicate = int(clean_df["vin"].duplicated().sum())
@@ -871,6 +861,7 @@ def assemble(cfg: Config, *, date_from: str | None = None, date_to: str | None =
             "n_rows": n_rows_raw, "n_vin": n_vin, "n_dummy_excluded": n_dummy,
             "n_duplicate": n_duplicate, "n_datetime_parse_fail": n_parse_fail,
             "categories": categories, "n_vin_not_in_ledger": n_vin_not_in_ledger,
+            "n_size_under": n_size_under, "n_size_over": n_size_over,
         })
 
     for required in assemble_cfg["require_sources"]:
