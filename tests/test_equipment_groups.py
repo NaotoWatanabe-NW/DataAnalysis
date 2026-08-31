@@ -15,7 +15,12 @@ import pandas as pd
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src"))
 
-from defect_analysis.analysis_data import equipment_measure_groups  # noqa: E402
+from defect_analysis.analysis_data import (  # noqa: E402
+    build_repair_group_columns,
+    equipment_measure_groups,
+    traceability_measure_columns,
+)
+from defect_analysis.config import Config  # noqa: E402
 
 
 def _df() -> pd.DataFrame:
@@ -60,6 +65,68 @@ class EquipmentMeasureGroupsTest(unittest.TestCase):
         df_one = df_two.drop(columns=[c for c in df_two.columns if c.startswith("EQ-02__")])
         self.assertEqual(len(equipment_measure_groups(df_two)), 2)
         self.assertEqual(len(equipment_measure_groups(df_one)), 1)
+
+
+class TraceabilityMeasureColumnsRepairGroupTest(unittest.TestCase):
+    """docs/repair_group_comparison_design.md §10-13: 群分け列は設備扱いされない。
+
+    `build_repair_group_columns` が実際に生成した列（列名は直書きせず、呼び出し前後の
+    差分から動的に検出する）が `traceability_measure_columns` / `equipment_measure_groups`
+    の段階で設備測定値として扱われないことを検証する。
+    """
+
+    def _panel_with_generated_group_columns(self) -> tuple[pd.DataFrame, set[str]]:
+        df = pd.DataFrame(
+            {
+                "EQ-01__pressure": [1.0, 2.0],
+                "has_repair_record": [0, 1],
+                "repair_修正__統合カテゴリ__タレ": [0, 1],
+            }
+        )
+        cfg = Config(
+            {
+                "analysis": {
+                    "repair_groups": [
+                        {
+                            "name": "タレ",
+                            "groups": [
+                                {"label": "修正なし", "column": "has_repair_record", "eq": 0},
+                                {"label": "タレ", "column": "repair_修正__統合カテゴリ__タレ", "min": 1},
+                            ],
+                        }
+                    ]
+                }
+            },
+            root=Path("/tmp"),
+        )
+        columns_before = set(df.columns)
+        df = build_repair_group_columns(df, cfg)
+        generated = set(df.columns) - columns_before
+        return df, generated
+
+    def test_excludes_repair_group_columns_including_the_binary_variant(self):
+        df, generated = self._panel_with_generated_group_columns()
+        # 生成列が0本だと以降のループが空振りで必ず緑になるため、まず1本以上あることを確認する。
+        self.assertGreaterEqual(len(generated), 1)
+
+        result = traceability_measure_columns(df.columns)
+
+        self.assertIn("EQ-01__pressure", result)
+        for col in generated:
+            with self.subTest(col=col):
+                self.assertNotIn(col, result)
+
+    def test_repair_group_columns_do_not_appear_as_an_equipment_group(self):
+        df, generated = self._panel_with_generated_group_columns()
+        self.assertGreaterEqual(len(generated), 1)
+
+        measure_cols = traceability_measure_columns(df.columns)
+        groups = equipment_measure_groups(df[measure_cols])
+
+        self.assertEqual(set(groups.keys()), {"EQ-01"})
+        for col in generated:
+            with self.subTest(col=col):
+                self.assertFalse(any(col in cols for cols in groups.values()))
 
 
 if __name__ == "__main__":

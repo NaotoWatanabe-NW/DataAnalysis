@@ -77,6 +77,9 @@ value,category
 
 ### 1.2 新 API（`src/defect_analysis/category_integrate.py` を全面書き換え）
 
+> 本節は 1 キー写像（CLI `category`）の仕様。repair の 4 キー写像は
+> `docs/repair_integrated_category_design.md` を参照。
+
 ```python
 DEFAULT_MAP_REL = Path("config") / "category_map.csv"
 DEFAULT_OUTPUT_COLUMN = "統合カテゴリ"

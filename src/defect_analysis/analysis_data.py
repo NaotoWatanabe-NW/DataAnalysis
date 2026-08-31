@@ -13,6 +13,7 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
+import numpy as np
 import pandas as pd
 
 from .config import Config
@@ -20,6 +21,9 @@ from .config import Config
 logger = logging.getLogger(__name__)
 
 _FILTER_OPS = ("eq", "in", "not_in", "min", "max")
+
+REPAIR_GROUP_PREFIX = "repair_group__"   # analysis.leakage_prefixes の "repair" に必ず乗せる（G3）
+REPAIR_GROUP_BINARY_SUFFIX = "__bin"
 
 
 @dataclass
@@ -36,9 +40,13 @@ def load_real_panel(cfg: Config) -> pd.DataFrame:
     """実データ経路の `data/interim/vin_panel.parquet` を読み込み、analysis.filters を適用して返す。
 
     parquet はスキーマに datetime を保持しているため CSV 用の parse_dates は不要。
+    `analysis.repair_groups`（修正なし車との対比用の群分け列）は `apply_filters` より前に
+    導出する。群分け列は行ごとに独立に決まるため前後で値は変わらず、前に置くことで
+    `analysis.filters` 側からも群分け列を参照できる（docs/repair_group_comparison_design.md §4）。
     """
     panel_path = cfg.path("real_ingest.panel_path", default="data/interim/vin_panel.parquet")
     df = pd.read_parquet(panel_path)
+    df = build_repair_group_columns(df, cfg)
     df = apply_filters(df, cfg)
     return df
 
@@ -117,9 +125,11 @@ def filters_summary(df: pd.DataFrame, rules: list[dict]) -> str:
     return " / ".join(_describe_clause(df, clause) for clause in rules)
 
 
-def _apply_clause(df: pd.DataFrame, clause: dict, on_missing: str) -> pd.DataFrame:
-    """1句を評価し、絞り込んだ DataFrame を返す。"""
-    desc = _describe_clause(df, clause)
+def clause_mask(df: pd.DataFrame, clause: dict, *, on_missing: str = "warn") -> pd.Series:
+    """1句を評価し、行を残すかの bool Series（index は df と同一）を返す。
+
+    `_apply_clause` から抽出した公開関数（`analysis.filters` / `repair_groups` 共通の DSL 評価）。
+    """
     if "query" in clause and "column" not in clause:
         # 注意: EQ-01__pressure のようにハイフンを含む列名は query の識別子として
         # 扱えないため、EQ 列はレンジ/集合系の句（min/max/in）で指定すること。
@@ -128,9 +138,7 @@ def _apply_clause(df: pd.DataFrame, clause: dict, on_missing: str) -> pd.DataFra
             idx = df.query(expr, engine="python").index
         except Exception as exc:
             raise ValueError(f"不正な query 式: {expr} ({exc})") from exc
-        out = df.loc[idx]
-        logger.debug("[filter] %s: %d 行", desc, len(out))
-        return out
+        return pd.Series(df.index.isin(idx), index=df.index)
 
     col = clause.get("column")
     if col is None:
@@ -140,7 +148,7 @@ def _apply_clause(df: pd.DataFrame, clause: dict, on_missing: str) -> pd.DataFra
         if on_missing == "error":
             raise ValueError(f"フィルタ対象列が存在しません: {col}")
         logger.warning("[filter] 列が存在しないためスキップ: %s", col)
-        return df
+        return pd.Series(True, index=df.index)
 
     known_ops = set(_FILTER_OPS) & clause.keys()
     if not known_ops:
@@ -171,6 +179,13 @@ def _apply_clause(df: pd.DataFrame, clause: dict, on_missing: str) -> pd.DataFra
         except Exception as exc:
             raise ValueError(f"[filter] {col} の比較に失敗: {exc}") from exc
 
+    return mask
+
+
+def _apply_clause(df: pd.DataFrame, clause: dict, on_missing: str) -> pd.DataFrame:
+    """1句を評価し、絞り込んだ DataFrame を返す（`clause_mask` + DEBUG ログの薄いラッパ）。"""
+    desc = _describe_clause(df, clause)
+    mask = clause_mask(df, clause, on_missing=on_missing)
     out = df[mask]
     logger.debug("[filter] %s: %d 行", desc, len(out))
     return out
@@ -204,6 +219,213 @@ def apply_filters(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         logger.warning("適用フィルタが全行を除外しました: %s", summary)
         raise ValueError(f"適用フィルタが全行を除外しました: {summary}")
     return filtered
+
+
+def _repair_group_clause_valid(df: pd.DataFrame, tag: str, label: str, clause: dict) -> bool:
+    """1 群の句が評価可能かを検査する（`_apply_clause` と同じ検査。G9 の 3〜5）。"""
+    if "query" in clause and "column" not in clause:
+        return True
+    col = clause.get("column")
+    if col is None:
+        logger.warning("[repair_groups/%s] 群 '%s' の句に演算子がありません: %r", tag, label, clause)
+        return False
+    if col not in df.columns:
+        # G9: 参照列が無いときは句をスキップして全行一致にはしない（スペックごと不採用にする）。
+        logger.warning("[repair_groups/%s] 参照列が存在しません: %s", tag, col)
+        return False
+    known_ops = set(_FILTER_OPS) & clause.keys()
+    if not known_ops:
+        logger.warning("[repair_groups/%s] 群 '%s' の句に演算子がありません: %r", tag, label, clause)
+        return False
+    return True
+
+
+def _validate_repair_group_groups(
+    df: pd.DataFrame, tag: str, groups: object, na_label: str | None = None,
+) -> list[tuple[str, dict]] | None:
+    """`groups`（形式A）を検査し `(label, clause)` のリストを返す（不合格なら None。G9 の 3〜5）。
+
+    `na_label` は「どの群にも該当しない行」用の第3群ラベルのため、`groups` 内のいずれかの
+    `label` と一致すると `s.fillna(na_label)` が未割当行をその群へ吸収してしまい、2群スペックの
+    `__bin` にまで漏れ込む（対照群の汚染）。そのため `na_label` も重複チェックの対象に含める。
+    """
+    if not isinstance(groups, list) or not groups:
+        logger.warning("[repair_groups/%s] groups が空かリストではありません: %r", tag, groups)
+        return None
+
+    labels: list[str] = []
+    clauses: list[tuple[str, dict]] = []
+    for g in groups:
+        if not isinstance(g, dict):
+            logger.warning("[repair_groups/%s] groups の要素が dict ではありません: %r", tag, g)
+            return None
+        label = g.get("label")
+        if not label or not isinstance(label, str):
+            logger.warning("[repair_groups/%s] groups の要素に label がありません: %r", tag, g)
+            return None
+        if label in labels:
+            logger.warning("[repair_groups/%s] label が重複しています: %s", tag, label)
+            return None
+        if na_label and label == na_label:
+            logger.warning(
+                "[repair_groups/%s] na_label '%s' が群ラベル '%s' と衝突しています。"
+                "na_label には groups に無いラベルを指定してください",
+                tag, na_label, label,
+            )
+            return None
+        clause = {k: v for k, v in g.items() if k != "label"}
+        if not _repair_group_clause_valid(df, tag, label, clause):
+            return None
+        labels.append(label)
+        clauses.append((label, clause))
+    return clauses
+
+
+def _log_repair_group_counts(tag: str, s: pd.Series, labels: list[str] | None) -> None:
+    """群ごとの行数を INFO ログに出す（G10）。labels 未指定なら頻度降順で全水準を出す。"""
+    if labels is not None:
+        items = [(label, int((s == label).sum())) for label in labels]
+    else:
+        items = [(str(label), int(n)) for label, n in s.value_counts(dropna=True).items()]
+    parts = [f"{label}={n:,}" for label, n in items]
+    parts.append(f"未割当={int(s.isna().sum()):,}")
+    logger.info("[repair_groups/%s] %s", tag, " / ".join(parts))
+
+
+def _build_groups_form(
+    df: pd.DataFrame, tag: str, groups: object, na_label: str | None,
+) -> tuple[pd.Series, pd.Series | None] | None:
+    """§3.2 の形式A（`analysis.filters` と同じ句のリスト）を評価する（不合格なら None）。
+
+    複数の句に一致した行は「リスト順で最初に一致した群」に入れる（先勝ち。G6）。
+    """
+    clauses = _validate_repair_group_groups(df, tag, groups, na_label)
+    if clauses is None:
+        return None
+
+    labels = [label for label, _ in clauses]
+    masks = [(label, clause_mask(df, clause, on_missing="warn")) for label, clause in clauses]
+
+    match_total = pd.Series(0, index=df.index)
+    for _, m in masks:
+        match_total = match_total + m.astype(int)
+    overlap_rows = int((match_total >= 2).sum())
+
+    s = pd.Series(np.nan, index=df.index, dtype=object)
+    for label, m in masks:
+        s = s.mask(m & s.isna(), label)
+
+    for label in labels:
+        if int((s == label).sum()) == 0:
+            logger.warning("[repair_groups/%s] 群 '%s' に該当する行がありません", tag, label)
+    if overlap_rows:
+        logger.warning(
+            "[repair_groups/%s] %d 行が複数の群に該当したため、先に宣言された群に割り当てました",
+            tag, overlap_rows,
+        )
+
+    log_labels = list(labels)
+    if na_label:
+        s = s.fillna(na_label)
+        log_labels.append(na_label)
+    _log_repair_group_counts(tag, s, log_labels)
+
+    bin_series = None
+    if len(labels) == 2:
+        # G8: 0 = 1番目のラベル、1 = 2番目のラベル。na_label で埋めた行は辞書に無いため NaN のまま
+        # （2群比較の母集団から自動的に外れる）。
+        bin_series = s.map({labels[0]: 0.0, labels[1]: 1.0}).astype("float64")
+    return s, bin_series
+
+
+def _build_base_column_form(
+    df: pd.DataFrame, tag: str, base_column: object, na_label: str | None,
+) -> tuple[pd.Series, None] | None:
+    """§3.2 の形式B（既存カテゴリ列の流用）を評価する（不合格なら None）。"""
+    if not base_column or not isinstance(base_column, str):
+        logger.warning("[repair_groups/%s] base_column が空か非文字列です: %r", tag, base_column)
+        return None
+    if base_column not in df.columns:
+        logger.warning("[repair_groups/%s] 参照列が存在しません: %s", tag, base_column)
+        return None
+
+    s = df[base_column].astype(object)
+    if na_label:
+        s = s.fillna(na_label)
+    _log_repair_group_counts(tag, s, None)
+    return s, None
+
+
+def _apply_repair_group_spec(df: pd.DataFrame, spec: object, index: int, created_names: set[str]) -> None:
+    """1 スペックを検証・評価し、合格なら df に列を追加する（不合格なら WARNING を出してスキップ。G9）。"""
+    if not isinstance(spec, dict):
+        logger.warning("[repair_groups/%d] スペックが dict ではありません: %r", index, spec)
+        return
+    name = spec.get("name")
+    if not name or not isinstance(name, str):
+        logger.warning("[repair_groups/%d] name が空か非文字列です: %r", index, name)
+        return
+    if not name.strip():
+        logger.warning("[repair_groups/%d] name が空白のみです: %r", index, name)
+        return
+    tag = name
+
+    groups = spec.get("groups")
+    base_column = spec.get("base_column")
+    if (groups is None) == (base_column is None):
+        logger.warning("[repair_groups/%s] groups と base_column はどちらか一方のみ指定してください", tag)
+        return
+
+    col_name = f"{REPAIR_GROUP_PREFIX}{name}"
+    bin_col_name = f"{col_name}{REPAIR_GROUP_BINARY_SUFFIX}"
+    # created_names のチェックを列存在チェックより先に行う: 同一 repair_groups リスト内で name が
+    # 重複した場合、後発スペックの原因は「name の重複」であって「パネルに元から同名列があった」
+    # ではないため、ログの文言が実際の原因を指すよう判定順を分ける。
+    if name in created_names:
+        logger.warning("[repair_groups/%s] name が重複しています: %s", tag, name)
+        return
+    if col_name in df.columns or bin_col_name in df.columns:
+        logger.warning("[repair_groups/%s] 列 '%s' は既に存在します（上書きしません）", tag, col_name)
+        return
+
+    na_label = spec.get("na_label")
+    try:
+        if groups is not None:
+            result = _build_groups_form(df, tag, groups, na_label)
+        else:
+            result = _build_base_column_form(df, tag, base_column, na_label)
+    except Exception:
+        logger.warning("[repair_groups/%s] スペックの評価に失敗しました", tag, exc_info=True)
+        return
+    if result is None:
+        return  # 検証エラーは各 _build_* 内で既に WARNING 済み
+
+    series, bin_series = result
+    df[col_name] = series
+    created_names.add(name)
+    if bin_series is not None:
+        df[bin_col_name] = bin_series
+
+
+def build_repair_group_columns(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """analysis.repair_groups の宣言に従い群分け列を df に追加して返す。
+
+    df を **破壊的に更新**する（列の追加のみ。既存列は変更しない）。呼び出し元は
+    load_real_panel（read_parquet 直後）のみを想定している。21,020 行 × 1,357 列
+    （複製すると約 230MB）のパネル全体を複製しないための設計（G11）。
+    宣言が空なら df をそのまま返す。設定誤りはスペック単位で WARNING を出してスキップし、
+    例外は投げない（G9）。生成列名は必ず `repair_group__{name}`（+ 2群のとき `__bin`）になり、
+    `analysis.leakage_prefixes` の "repair" に前方一致するため `resolve_predictors` が
+    常に説明変数から除外する（G3）。
+    """
+    specs = cfg.get("analysis.repair_groups", []) or []
+    if not specs:
+        return df
+
+    created_names: set[str] = set()
+    for index, spec in enumerate(specs):
+        _apply_repair_group_spec(df, spec, index, created_names)
+    return df
 
 
 @dataclass(frozen=True)

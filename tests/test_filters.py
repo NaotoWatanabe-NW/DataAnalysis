@@ -15,7 +15,7 @@ import pandas as pd
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src"))
 
-from defect_analysis.analysis_data import apply_filters  # noqa: E402
+from defect_analysis.analysis_data import apply_filters, clause_mask  # noqa: E402
 from defect_analysis.config import Config  # noqa: E402
 
 
@@ -150,6 +150,42 @@ class ApplyFiltersLoggingTest(unittest.TestCase):
         with self.assertLogs("defect_analysis.analysis_data", level="INFO") as cm:
             apply_filters(_df(), cfg)
         self.assertTrue(any("4 -> 3" in msg for msg in cm.output))
+
+
+class ClauseMaskTest(unittest.TestCase):
+    """`clause_mask`（`_apply_clause` から切り出した公開関数。docs/repair_group_comparison_design.md §10-15）。
+
+    `analysis.repair_groups` からも再利用される DSL 評価そのもの。ここでは `apply_filters` を
+    経由せず直接呼び出し、index 整合の bool Series を返すことを固定する。
+    """
+
+    def test_returns_boolean_series_aligned_with_a_non_default_index(self):
+        df = _df()
+        df.index = [10, 20, 30, 40]
+
+        mask = clause_mask(df, {"column": "plant_code", "eq": "P01"})
+
+        self.assertEqual(mask.dtype, bool)
+        self.assertEqual(list(mask.index), list(df.index))
+        self.assertEqual(mask.tolist(), [True, True, True, False])
+
+    def test_query_clause_returns_a_mask_matching_apply_filters_result(self):
+        df = _df()
+        mask = clause_mask(df, {"query": "ng_rate < 0.5"})
+
+        self.assertEqual(sorted(df.loc[mask, "ng_rate"].tolist()), [0.1, 0.3])
+
+    def test_missing_column_with_warn_returns_all_true_without_raising(self):
+        df = _df()
+        with self.assertLogs("defect_analysis.analysis_data", level="WARNING"):
+            mask = clause_mask(df, {"column": "plant_line", "eq": "X"}, on_missing="warn")
+
+        self.assertTrue(mask.all())
+
+    def test_missing_column_with_error_raises_value_error(self):
+        df = _df()
+        with self.assertRaises(ValueError):
+            clause_mask(df, {"column": "plant_line", "eq": "X"}, on_missing="error")
 
 
 if __name__ == "__main__":

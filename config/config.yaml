@@ -91,6 +91,27 @@ analysis:
   eda_cross_equipment_top_k: 3         # 設備間ヒートマップに採用する設備あたりの代表列数
   eda_cross_equipment_max_columns: 60  # 設備間ヒートマップの総列数上限（超過時は先頭のみ使用）
 
+  # 修正なし車 vs 特定カテゴリの修正があった車の対比列（分析時に導出。パネル（parquet）には保存しない。G2）。
+  #   docs/repair_group_comparison_design.md 参照。列名はコード側で `repair_group__{name}` に固定され、
+  #   leakage_prefixes の "repair" に前方一致するため resolve_predictors が説明変数から自動除外する（G3）。
+  #   groups がちょうど2群のスペックは `repair_group__{name}__bin`（0.0/1.0/NaN）も対で生成され、
+  #   analysis.targets.classification に足せば stats（BH-FDR 補正付き）で群間差検定ができる（G8・§7）。
+  #   形式は2つ（併用不可。両方指定/両方省略はそのスペックだけ WARN でスキップ）:
+  #     - groups: analysis.filters と同じ句のリスト（label 必須。複数の群に該当する行はリスト順で先勝ち。
+  #       「該当カテゴリのカウント列（repair_修正__統合カテゴリ__*）が1件以上」を群の条件にするのが推奨）
+  #     - base_column: 既存カテゴリ列（例: repair_修正__top_統合カテゴリ）をそのまま群として使う
+  #   na_label を書くと、どの群にも該当しない行（groups）/ 欠損行（base_column）を第3群としてラベル化する。
+  #   既定は空リスト（列は1本も増えず現行挙動と完全一致）。以下2件は例。不要なら削除可。
+  repair_groups:
+    - name: タレ
+      groups:
+        - {label: 修正なし, column: has_repair_record, eq: 0}
+        - {label: タレ,     column: repair_修正__統合カテゴリ__タレ, min: 1}
+    - name: 色ブツ
+      groups:
+        - {label: 修正なし, column: has_repair_record, eq: 0}
+        - {label: 色ブツ,   column: repair_修正__統合カテゴリ__色ブツ_黒ブツ_白ブツ, min: 1}
+
   # 追加の EDA グラフ（既存の固定図に「追加」で出力される。空なら従来どおり固定図のみ）。
   #   type: scatter | bar | histogram | box | heatmap
   #   共通: title / output（reports/eda 配下のファイル名）/ filters（analysis.filters と同じ句）/ hue（色分け列）
@@ -106,7 +127,41 @@ analysis:
   #       - {type: histogram, x: lead_time_sec, bins: 40, density: true, hue: has_repair_record}
   #       - {type: box, x: production_shift, y: EQ-01__pressure}
   #       - {type: heatmap, columns: [EQ-01__pressure, EQ-01__stroke, lead_time_sec], method: spearman}
-  custom_charts: []
+  #   以下4件は analysis.repair_groups の例（タレ/色ブツ）を使った対比グラフ。例。不要なら削除可
+  #   （docs/repair_group_comparison_design.md §6.1/§6.2）。
+  custom_charts:
+    - type: box
+      x: repair_group__タレ
+      y: ブース__フラッシュオフ_HAB1_送気_絶対湿度_測定値
+      filters:
+        - {column: repair_group__タレ, in: [修正なし, タレ]}
+      title: 修正なし vs タレ修正 ｜ ブース フラッシュオフHAB1 送気 絶対湿度
+      output: repair_group_タレ_絶対湿度.png
+    - type: box
+      x: repair_group__色ブツ
+      y: trend__浮遊ゴミ_中上塗ブース前_粒子数_小_測定値
+      filters:
+        - {column: repair_group__色ブツ, in: [修正なし, 色ブツ]}
+      title: 修正なし vs 色ブツ修正 ｜ 浮遊ゴミ 中上塗ブース前 粒子数(小)
+      output: repair_group_色ブツ_浮遊ゴミ.png
+    # 色ブツはライン層別（交絡対策。§1.3・§6.2 方法1）。中上塗ブース前粒子数はライン設備差の
+    # 可能性があるため、全体図だけで「色ブツ修正が多いほど粒子数が多い」と即断しないこと。
+    - type: box
+      x: repair_group__色ブツ
+      y: trend__浮遊ゴミ_中上塗ブース前_粒子数_小_測定値
+      filters:
+        - {column: repair_group__色ブツ, in: [修正なし, 色ブツ]}
+        - {column: ブース__Line, eq: 1}
+      title: "[Line1] 修正なし vs 色ブツ修正 ｜ 浮遊ゴミ 中上塗ブース前 粒子数(小)"
+      output: repair_group_色ブツ_浮遊ゴミ_line1.png
+    - type: box
+      x: repair_group__色ブツ
+      y: trend__浮遊ゴミ_中上塗ブース前_粒子数_小_測定値
+      filters:
+        - {column: repair_group__色ブツ, in: [修正なし, 色ブツ]}
+        - {column: ブース__Line, eq: 2}
+      title: "[Line2] 修正なし vs 色ブツ修正 ｜ 浮遊ゴミ 中上塗ブース前 粒子数(小)"
+      output: repair_group_色ブツ_浮遊ゴミ_line2.png
   custom_chart_max_hue: 8          # hue 水準数の上限（超過分は頻度上位のみ描画し WARN）
   custom_chart_max_points: 20000   # scatter の最大描画点数（超過時は決定的サンプリング）
 
@@ -158,8 +213,20 @@ real_ingest:
     suffix_policy: keep        # keep（既定・別キー） | merge（vin_base で丸める）
     exclude_regex: "(?i)(DUMMY|EMPTY)"
 
-  # 複数行/VIN ソース（上塗/下塗/ホイ黒ロボット。自動判定・宣言不要）は
-  # {source}__n_rows（行数）のみを出力するため設定項目は無い（D5・§8.1.2）。
+  # 複数行/VIN ソース（上塗/下塗/ホイ黒ロボット。自動判定・宣言不要）の集約。
+  # docs/panel_prune_and_multirow_agg_design.md §5（M1〜M6。D5 の統計量全廃を上書き）
+  multi_row:
+    enabled: true
+    # 末尾一致したら「ロボットごとに異なる測定値」とみなし統計量に畳む。
+    # 一致しない列は VIN 内一定とみなし代表値 1 列にする（値からは判定しない。M2）
+    stat_suffixes: [測定値, 設定値, RT値, 使用量, 充填量, 排出量, サイクルタイム]
+    # 2026-08-30 ユーザー判断: min/std/max を外し mean のみ（上塗/下塗/ホイ黒 3 ソース共通）。
+    # __min は非稼働ロボットの 0 を拾うだけで工程情報を持たない列が多く、列数を必要以上に
+    # 増やさない方針とした（実測で上塗の __min 列12本中8本が定数落ち）。
+    numeric_aggs: [mean]                  # stat 列に適用
+    datetime_aggs: [min]                  # 日時列。__min は trend アンカーにも使われる（対象外・変更なし）
+    exclude_columns: [ロボット]            # 行の識別子。代表値に意味が無く n_rows と情報が重複（M6）
+    by_source: {}                         # ソース別上書き（M5）。3 ソースとも mean で揃ったため既定は無し
 
   defect:                      # 出力は {P}__has のみ（D11）。種類/部位/時刻系のキーは撤廃済み
     size_column: 不良サイズ    # 正規化後の列名（by_size_bin 有効時のみ使う）
@@ -180,8 +247,27 @@ real_ingest:
       部品名: false
       修正内容: false
       部位: false
+      統合カテゴリ: true             # ★追加: 対比表のグラフ項目（43 列。docs/repair_integrated_category_design.md）
     worker_column: 修正員_id         # pii.suffix 適用後の名前
-    max_category_columns: 30         # 展開後カウント列の合計上限。超過で ValueError
+    max_category_columns: 100        # ★30 -> 100（大分類 29 + 統合カテゴリ 43 = 72 に対する余裕）
+
+    # ★追加: 塗装課内不良対比表による統合カテゴリ付与（4キー厳密一致。IC4）
+    category_map:
+      enabled: true
+      path: config/塗装課内不良対比表_まとめ.csv   # cfg.root 基準の相対パス
+      key_columns:                   # 対比表の列 -> repair の列（この順で完全一致。フォールバック無し）
+        作業工程: 入力工程
+        大分類: 大分類
+        中分類: 中分類
+        小分類: 小分類
+      value_column: グラフ項目
+      output_column: 統合カテゴリ
+      excluded_values: ["-"]         # 表が「グラフ集計対象外」を明示する値
+      labels:                        # 未一致行に必ず入る値（NaN を作らない。IC6）
+        out_of_scope_process: 対象外工程   # 入力工程が対比表に無い（塗装課以外の工程）
+        unmatched: 未分類                  # 対象工程だが4キーの組合せが表に無い（表の育て漏れ）
+        excluded: グラフ対象外             # グラフ項目が "-"
+      on_duplicate_key: first        # first（グラフ項目の昇順先頭を採用＋WARN） | error（即停止）
 
   trend:
     enabled: true
@@ -201,4 +287,14 @@ real_ingest:
     date_from: null            # "2026-07-24"（null で全期間）
     date_to: null
     require_sources: []        # 0 行なら ValueError にするソース名
-    max_columns_per_source: 200   # size_bin の列数ガード（§8.1.3-A）。pivot 廃止後はこの用途のみ
+    max_columns_per_source: 200   # size_bin と複数行/VIN 集約の両方の列数ガード（§5.3）
+
+    # 低カーディナリティ列の剪定。docs/panel_prune_and_multirow_agg_design.md §4（P1〜P8）
+    prune_low_cardinality:
+      enabled: true
+      drop_all_nan: true          # nunique(dropna=True) == 0
+      drop_constant: true         # nunique(dropna=True) == 1（2 値は落とさない）
+      protect_columns: [vin, vin_base, vin_pass_no, vin_format, has_repair_record]
+      protect_prefixes: [present__, defect_, repair_]
+      protect_name_substrings: [フラグ]   # 部分一致。ユーザー指示「フラグとついた列はそのままにする」
+      report_filename: panel_pruned_columns.csv

@@ -14,6 +14,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .category_integrate import (
+    apply_composite_category,
+    load_composite_category_table,
+    summarize_unmatched_keys,
+)
 from .config import Config
 from .naming import normalize_name, prefixed
 from .raw_convert import convert_config, read_source, should_keep_float64
@@ -44,9 +49,20 @@ DEFAULT_REPAIR = {
         "部品名": False,
         "修正内容": False,
         "部位": False,
+        "統合カテゴリ": True,
     },
     "worker_column": "修正員_id",
-    "max_category_columns": 30,
+    "max_category_columns": 100,
+}
+DEFAULT_REPAIR_CATEGORY_MAP = {
+    "enabled": True,
+    "path": "config/塗装課内不良対比表_まとめ.csv",
+    "key_columns": {"作業工程": "入力工程", "大分類": "大分類", "中分類": "中分類", "小分類": "小分類"},
+    "value_column": "グラフ項目",
+    "output_column": "統合カテゴリ",
+    "excluded_values": ["-"],
+    "labels": {"out_of_scope_process": "対象外工程", "unmatched": "未分類", "excluded": "グラフ対象外"},
+    "on_duplicate_key": "first",   # first | error
 }
 DEFAULT_TREND = {
     "enabled": True,
@@ -67,6 +83,28 @@ DEFAULT_ASSEMBLE = {
     "date_to": None,
     "require_sources": [],
     "max_columns_per_source": 200,
+}
+DEFAULT_MULTI_ROW = {
+    "enabled": True,
+    "stat_suffixes": ["測定値", "設定値", "RT値", "使用量", "充填量", "排出量", "サイクルタイム"],
+    # 2026-08-30 ユーザー判断: min/std/max を外し mean のみにする（上塗/下塗/ホイ黒 3 ソース共通）。
+    # __min は「非稼働ロボットの 0」を拾うだけで工程情報を持たない列が多かった（実測。上塗の __min
+    # 列12本中8本が定数落ち）。列数を必要以上に増やさない方針。
+    "numeric_aggs": ["mean"],
+    "datetime_aggs": ["min"],
+    "exclude_columns": ["ロボット"],
+    # ソース別上書きの既定は無し（3 ソースとも numeric_aggs: [mean] で揃ったため）。
+    # 仕組み自体は M5 のとおり残す（per-source に集約関数を変えたくなったときのため）。
+    "by_source": {},
+}
+DEFAULT_PRUNE = {
+    "enabled": True,
+    "drop_all_nan": True,
+    "drop_constant": True,
+    "protect_columns": ["vin", "vin_base", "vin_pass_no", "vin_format", "has_repair_record"],
+    "protect_prefixes": ["present__", "defect_", "repair_"],
+    "protect_name_substrings": ["フラグ"],
+    "report_filename": "panel_pruned_columns.csv",
 }
 
 _VIN_FORMAT_TYPE_RE = re.compile(r"^[A-Z0-9]{5}-\d{6}$")
@@ -114,6 +152,36 @@ def _assemble_config(cfg: Config) -> dict:
     return merged
 
 
+def _multi_row_config(cfg: Config, source: str) -> dict:
+    """`real_ingest.multi_row` を `DEFAULT_MULTI_ROW` で補完し、`by_source[source]` があれば
+    該当キーだけをその上に重ねて返す（§7。部分上書きで他キーの既定が消えないこと。
+    `_repair_category_map_config` と同じ流儀＝トップレベルと `by_source[source]` の両方を
+    2 段マージする。`by_source` はソース名キーだけでなく、その値である per-source 辞書自体も
+    既定とユーザー指定をキー単位でマージする。丸ごと置換すると、ユーザーが 1 キーだけ書いた
+    ときに組み込み既定の他キーが消えてしまう）。
+    """
+    user_cfg = cfg.get("real_ingest.multi_row", {}) or {}
+    merged = dict(DEFAULT_MULTI_ROW)
+    merged.update(user_cfg)
+    overrides = {
+        **DEFAULT_MULTI_ROW["by_source"].get(source, {}),
+        **((user_cfg.get("by_source") or {}).get(source) or {}),
+    }
+    resolved = {**merged, **overrides}
+    resolved.pop("by_source", None)
+    return resolved
+
+
+def _prune_config(cfg: Config) -> dict:
+    """`real_ingest.assemble.prune_low_cardinality` を `DEFAULT_PRUNE` で補完して返す
+    （既存 `_defect_config` / `_repair_config` と同じ流儀。部分上書きで他キーの既定が消えないこと）。
+    """
+    user_cfg = _assemble_config(cfg).get("prune_low_cardinality") or {}
+    merged = dict(DEFAULT_PRUNE)
+    merged.update(user_cfg)
+    return merged
+
+
 def _write_report(reports_dir: Path, filename: str, df: pd.DataFrame) -> Path:
     path = reports_dir / filename
     df.to_csv(path, index=False)
@@ -147,16 +215,96 @@ def prepare_single_row_source(df: pd.DataFrame, source: str) -> pd.DataFrame:
     return work.rename(columns=rename_map)
 
 
-def prepare_multi_row_source(df: pd.DataFrame, source: str) -> pd.DataFrame:
-    """複数行/VIN ソースを `{source}__n_rows`（行数）1 列だけに集約する（D5・§8.1.2）。
+MULTI_ROW_AGG_KINDS = ("stat", "rep", "datetime")
 
-    数値列・日時列・文字列列に対する統計量集約、設備別 pivot は一切行わない
-    （2026-08-28 改定。したがって `time_column` もパネルに残らず、複数行/VIN ソースは
-    trend アンカーになり得ない。§8.4(2)）。
+
+def plan_multi_row_aggregation(df: pd.DataFrame, source: str, cfg: Config) -> dict[str, list[str]]:
+    """列名と dtype だけから集約計画 `{"stat": [...], "rep": [...], "datetime": [...]}` を返す。
+
+    値（VIN 内一定率など）は一切見ない（M2）。したがって同じ CSV ヘッダならどの期間で実行しても
+    同じ列集合になる（`docs/panel_prune_and_multirow_agg_design.md` §5.1）。
     """
-    work = df[["vin"]]
-    n_rows = work.groupby("vin").size().rename(prefixed(source, "n_rows"))
-    return n_rows.reset_index()
+    multi_row_cfg = _multi_row_config(cfg, source)
+    stat_suffixes = tuple(multi_row_cfg["stat_suffixes"])
+    exclude_columns = set(multi_row_cfg["exclude_columns"])
+
+    plan: dict[str, list[str]] = {kind: [] for kind in MULTI_ROW_AGG_KINDS}
+    for col in df.columns:
+        if col == "vin" or col in _DROP_ALWAYS or col in exclude_columns:
+            continue
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            plan["datetime"].append(col)
+        elif col.endswith(stat_suffixes):
+            if pd.api.types.is_numeric_dtype(df[col]):
+                plan["stat"].append(col)
+            else:
+                logger.warning(
+                    "[traceability/%s] 列 %s は stat_suffixes に一致しますが数値ではないため"
+                    "代表値にします", source, col,
+                )
+                plan["rep"].append(col)
+        else:
+            plan["rep"].append(col)
+    return plan
+
+
+def prepare_multi_row_source(df: pd.DataFrame, source: str, cfg: Config) -> pd.DataFrame:
+    """複数行/VIN ソースを 1 行/VIN に畳む。結合キー `vin` を列として持つ DataFrame を返す
+    （M1〜M6・§5.2。D5 の「統計量集約の全廃」を撤回、「pivot しない」は維持）。
+
+    列名の末尾一致規約（`plan_multi_row_aggregation`）で振り分け、統計量列は
+    `{source}__{col}__{agg}`、代表値列は `{source}__{col}`（サフィックス無し・`groupby("vin").min()`）、
+    日時列は `{source}__{col}__{agg}`（既定 `__min`）、行数は `{source}__n_rows` として出す。
+    """
+    multi_row_cfg = _multi_row_config(cfg, source)
+    grouped = df.groupby("vin")
+    n_rows = grouped.size().rename(prefixed(source, "n_rows"))
+
+    if not multi_row_cfg["enabled"]:
+        return n_rows.reset_index()
+
+    numeric_aggs = list(multi_row_cfg["numeric_aggs"])
+    datetime_aggs = list(multi_row_cfg["datetime_aggs"])
+    if not numeric_aggs:
+        raise ValueError(f"[traceability/{source}] numeric_aggs が空です。enabled: false を使ってください。")
+    if not datetime_aggs:
+        raise ValueError(f"[traceability/{source}] datetime_aggs が空です。enabled: false を使ってください。")
+
+    plan = plan_multi_row_aggregation(df, source, cfg)
+
+    # §5.3: データを畳む前に列数を検査する。
+    max_columns = int(_assemble_config(cfg)["max_columns_per_source"])
+    n_cols = (
+        len(plan["stat"]) * len(numeric_aggs) + len(plan["rep"])
+        + len(plan["datetime"]) * len(datetime_aggs) + 1
+    )
+    if n_cols > max_columns:
+        raise ValueError(
+            f"[traceability/{source}] 複数行/VIN 集約の列数が上限を超えました: "
+            f"{n_cols} > max_columns_per_source={max_columns}"
+        )
+
+    parts: list[pd.DataFrame] = []
+
+    if plan["rep"]:
+        rep_out = grouped[plan["rep"]].min()  # M4: first は行順依存のため使わない
+        rep_out.columns = [prefixed(source, col) for col in rep_out.columns]
+        parts.append(rep_out)
+
+    if plan["stat"]:
+        stat_out = grouped[plan["stat"]].agg(numeric_aggs)
+        stat_out.columns = [prefixed(source, f"{col}__{agg}") for col, agg in stat_out.columns]
+        parts.append(stat_out)
+
+    if plan["datetime"]:
+        dt_out = grouped[plan["datetime"]].agg(datetime_aggs)
+        dt_out.columns = [prefixed(source, f"{col}__{agg}") for col, agg in dt_out.columns]
+        parts.append(dt_out)
+
+    parts.append(n_rows.to_frame())
+
+    result = pd.concat(parts, axis=1)
+    return result.reset_index()
 
 
 def _decimal_places(width: float) -> int:
@@ -278,6 +426,129 @@ def prepare_defect_source(df: pd.DataFrame, source: str, cfg: Config) -> pd.Data
     return result.reset_index()
 
 
+def _repair_category_map_config(cfg: Config) -> dict:
+    """`real_ingest.repair.category_map` を `DEFAULT_REPAIR_CATEGORY_MAP` とサブ辞書単位でマージする。
+
+    `_repair_config` は浅いマージなので、yaml 側に `category_map` を書くと既定辞書ごと
+    置き換わってしまう。`labels` と `key_columns` はさらにその内側のネスト辞書なので、
+    それぞれ個別に 2 段のマージが要る（§3.2）。`key_columns` を浅いマージのままにすると、
+    一部キーだけ上書きしたときに残りの既定キー対応が丸ごと消え、4 キー厳密一致（IC4）が
+    黙って1キー一致に劣化するため、ここで必ず両方を 2 段マージする。
+    """
+    user_cfg = _repair_config(cfg).get("category_map") or {}
+    merged = dict(DEFAULT_REPAIR_CATEGORY_MAP)
+    merged.update(user_cfg)
+    merged["labels"] = {**DEFAULT_REPAIR_CATEGORY_MAP["labels"], **(user_cfg.get("labels") or {})}
+    merged["key_columns"] = {
+        **DEFAULT_REPAIR_CATEGORY_MAP["key_columns"], **(user_cfg.get("key_columns") or {})
+    }
+    return merged
+
+
+def add_integrated_category(
+    df: pd.DataFrame, source: str, cfg: Config, *, map_cfg: dict | None = None
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """repair の 1 ソース分に統合カテゴリ列を付与する（config 解決・ログ出力を含む。§3.2/§4.4）。
+
+    戻り値: (統合カテゴリ列を追加した df のコピー, 未一致サマリ DataFrame)。
+    表が無効/不在なら (df, 空 DataFrame) を返す（§4.3）。
+    `map_cfg` は `_repair_category_map_config(cfg)` の解決済み結果。複数 repair ソースを
+    処理する呼び出し元が解決を使い回せるよう省略可能（省略時はここで解決する）。
+    """
+    map_cfg = map_cfg if map_cfg is not None else _repair_category_map_config(cfg)
+    labels = map_cfg["labels"]
+    output_column = map_cfg["output_column"]
+
+    if not map_cfg["enabled"]:
+        logger.info("[repair/%s] category_map.enabled=false のため統合カテゴリを付与しません。", source)
+        return df, pd.DataFrame()
+
+    path = Path(map_cfg["path"])
+    if not path.is_absolute():
+        path = cfg.root / path
+
+    table_key_columns = tuple(map_cfg["key_columns"].keys())
+    source_key_columns = tuple(map_cfg["key_columns"].values())
+    missing_source_columns = [c for c in source_key_columns if c not in df.columns]
+    if missing_source_columns:
+        logger.warning(
+            "[repair/%s] repair 側にキー列がありません: %s。統合カテゴリをスキップします。",
+            source, missing_source_columns,
+        )
+        return df, pd.DataFrame()
+
+    try:
+        table = load_composite_category_table(
+            path,
+            key_columns=table_key_columns,
+            value_column=map_cfg["value_column"],
+            on_duplicate_key=map_cfg["on_duplicate_key"],
+        )
+    except FileNotFoundError:
+        logger.warning("[repair/%s] 対比表が見つかりません: %s。統合カテゴリをスキップします。", source, path)
+        return df, pd.DataFrame()
+
+    if table.n_exact_duplicates:
+        logger.info("[repair/%s] 対比表の完全重複行を除去: %d 行", source, table.n_exact_duplicates)
+    for key, values in sorted(table.conflicts.items()):
+        logger.warning(
+            "[repair/%s] 対比表の4キーが競合: %s / 採用値=%s / 不採用値=%s",
+            source, key, values[0], list(values[1:]),
+        )
+
+    category = apply_composite_category(
+        df, table,
+        source_key_columns=source_key_columns,
+        excluded_values=map_cfg["excluded_values"],
+        labels=labels,
+    )
+
+    result = df.copy()
+    result[output_column] = category
+
+    n_rows = len(category)
+    out_of_scope_mask = category == labels["out_of_scope_process"]
+    unmatched_mask = category == labels["unmatched"]
+    n_out_of_scope = int(out_of_scope_mask.sum())
+    n_unmatched = int(unmatched_mask.sum())
+    n_matched = n_rows - n_out_of_scope - n_unmatched
+    rate = (n_matched / n_rows) if n_rows else 0.0
+    logger.info(
+        "[repair/%s] 統合カテゴリを付与: %d 行 / %d 種（一致 %d 行 = %.2f%%）",
+        source, n_rows, category.nunique(), n_matched, rate * 100,
+    )
+
+    if n_out_of_scope:
+        counts = df.loc[out_of_scope_mask, source_key_columns[0]].value_counts()
+        detail = ", ".join(f"{k}={v}" for k, v in counts.items())
+        logger.info(
+            "[repair/%s] 対象外工程（対比表に無い入力工程）: %d 行 / %s", source, n_out_of_scope, detail,
+        )
+
+    unmatched_summary = summarize_unmatched_keys(
+        df, category,
+        source_key_columns=source_key_columns,
+        labels=labels,
+        vin_column="vin" if "vin" in df.columns else None,
+    )
+
+    if n_unmatched:
+        unmatched_rows = unmatched_summary[unmatched_summary["区分"] == labels["unmatched"]]
+        n_kinds_unmatched = len(unmatched_rows)
+        top = unmatched_rows.head(20)
+        top_text = ", ".join(
+            "/".join(str(row[c]) for c in source_key_columns) + f"={int(row['n_rows'])}"
+            for _, row in top.iterrows()
+        )
+        suffix = f", 他 {n_kinds_unmatched - 20} 種" if n_kinds_unmatched > 20 else ""
+        logger.warning(
+            "[repair/%s] 対比表に無い組合せ: %d 種 / %d 行を「未分類」にしました: %s%s",
+            source, n_kinds_unmatched, n_unmatched, top_text, suffix,
+        )
+
+    return result, unmatched_summary
+
+
 def prepare_repair_source(df: pd.DataFrame, source: str, cfg: Config) -> pd.DataFrame:
     """repair ソースを VIN 単位に集約する。列は必ず `repair_` で始める（R4）。
 
@@ -357,8 +628,12 @@ def prepare_repair_source(df: pd.DataFrame, source: str, cfg: Config) -> pd.Data
 
 
 def _top_value(s: pd.Series) -> object:
+    """最頻値を返す。同数タイは値の昇順で決定的に選ぶ（§6。value_counts() の出現順に依存させない）。"""
     counts = s.value_counts()
-    return counts.index[0] if len(counts) else pd.NA
+    if len(counts) == 0:
+        return pd.NA
+    counts = counts.sort_index().sort_values(ascending=False, kind="stable")
+    return counts.index[0]
 
 
 # ---------------------------------------------------------------------
@@ -728,6 +1003,94 @@ def _infer_column_source(col: str) -> str:
     return "other"
 
 
+PRUNE_REPORT_COLUMNS = [
+    "column", "source", "dtype", "n_unique", "n_missing", "value", "reason", "action", "rule",
+]
+
+
+def _protection_rule(col: str, prune_cfg: dict) -> str | None:
+    """`col` を保護する規約名を返す（最初に一致したもの）。保護されないなら `None`。"""
+    if col in prune_cfg["protect_columns"]:
+        return "protect_columns"
+    prefix_hit = next((p for p in prune_cfg["protect_prefixes"] if col.startswith(p)), None)
+    if prefix_hit is not None:
+        return f"protect_prefixes:{prefix_hit}"
+    substring_hit = next((s for s in prune_cfg["protect_name_substrings"] if s in col), None)
+    if substring_hit is not None:
+        return f"protect_name_substrings:{substring_hit}"
+    return None
+
+
+def is_protected_column(col: str, prune_cfg: dict) -> bool:
+    """剪定から保護する列かを列名だけで判定する（値を見ない。P3）。"""
+    return _protection_rule(col, prune_cfg) is not None
+
+
+def prune_low_cardinality_columns(panel: pd.DataFrame, cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """低カーディナリティ列を落とし、`(剪定後パネル, 剪定レポート)` を返す（P1〜P4・§4）。
+
+    `enabled: false` なら panel をそのまま返し、レポートは `PRUNE_REPORT_COLUMNS` のヘッダのみ
+    0 行で返す（レポートのスキーマは常に一定。IC12 と同じ流儀）。列順は元の panel の順序を保つ
+    （`panel.drop(columns=...)` を使う。再構築しない）。
+    """
+    prune_cfg = _prune_config(cfg)
+    empty_report = pd.DataFrame(columns=PRUNE_REPORT_COLUMNS)
+
+    if not prune_cfg["enabled"]:
+        return panel, empty_report
+
+    rows: list[dict] = []
+    drop_cols: list[str] = []
+    for col in panel.columns:
+        s = panel[col]
+        n_unique = int(s.nunique(dropna=True))
+        is_all_nan = n_unique == 0
+        is_constant = n_unique == 1
+        if not ((prune_cfg["drop_all_nan"] and is_all_nan) or (prune_cfg["drop_constant"] and is_constant)):
+            continue
+
+        reason = "all_nan" if is_all_nan else "constant"
+        rule = _protection_rule(col, prune_cfg)
+        protected = rule is not None
+        action = "kept_protected" if protected else "dropped"
+        non_null = s.dropna()
+        value = non_null.iloc[0] if is_constant and len(non_null) else None
+
+        rows.append({
+            "column": col, "source": _infer_column_source(col), "dtype": str(s.dtype),
+            "n_unique": n_unique, "n_missing": int(s.isna().sum()), "value": value,
+            "reason": reason, "action": action, "rule": rule or "",
+        })
+        if not protected:
+            drop_cols.append(col)
+
+    report = pd.DataFrame(rows, columns=PRUNE_REPORT_COLUMNS)
+    report = report.sort_values(["action", "source", "column"], kind="stable").reset_index(drop=True)
+
+    pruned = panel.drop(columns=drop_cols)
+
+    n_dropped = len(drop_cols)
+    n_all_nan_dropped = int((report["reason"].eq("all_nan") & report["action"].eq("dropped")).sum())
+    n_constant_dropped = int((report["reason"].eq("constant") & report["action"].eq("dropped")).sum())
+    n_kept_protected = int(report["action"].eq("kept_protected").sum())
+    logger.info(
+        "列剪定: 削除 %d 列（全NaN %d / 定数 %d）、保護により残した無情報列 %d 列。詳細: reports/%s",
+        n_dropped, n_all_nan_dropped, n_constant_dropped, n_kept_protected, prune_cfg["report_filename"],
+    )
+    if n_kept_protected:
+        examples = report.loc[report["action"] == "kept_protected", "column"].head(3).tolist()
+        logger.warning(
+            "保護規約により、値が1種類しかない列を %d 列残しました（例: %s）。分析上は無情報です。",
+            n_kept_protected, ", ".join(examples),
+        )
+
+    n_total = len(panel.columns)
+    if n_total and (n_dropped / n_total) > 0.5:
+        logger.warning("剪定により列の過半数が削除されました: %d / %d 列", n_dropped, n_total)
+
+    return pruned, report
+
+
 def _downcast_final_panel(base: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     """出力直前に float64 列を float32 へ再ダウンキャストする（High-1）。
 
@@ -789,7 +1152,10 @@ def assemble(cfg: Config, *, date_from: str | None = None, date_to: str | None =
     quality_rows: list[dict] = []
     repair_source_names: set[str] = set()
     repair_vin_sets: dict[str, set[str]] = {}
+    unmatched_parts: list[pd.DataFrame] = []
     repair_cfg = _repair_config(cfg)
+    # repair ソース間で使い回す（cfg にのみ依存し、ソースごとに変わらないため1回だけ解決する）。
+    repair_category_map_cfg = _repair_category_map_config(cfg)
 
     for source in sources:
         if source.kind not in ("traceability", "defect", "repair"):
@@ -835,6 +1201,13 @@ def assemble(cfg: Config, *, date_from: str | None = None, date_to: str | None =
                 n_size_under = int((size_numeric < bin_min).sum())
                 n_size_over = int((size_numeric >= bin_max).sum())
         elif source.kind == "repair":
+            clean_df, unmatched = add_integrated_category(
+                clean_df, source.name, cfg, map_cfg=repair_category_map_cfg
+            )
+            if not unmatched.empty:
+                unmatched = unmatched.copy()
+                unmatched.insert(0, "source", source.name)
+                unmatched_parts.append(unmatched)
             prepared = prepare_repair_source(clean_df, source.name, cfg)
             n_duplicate = 0
             cat_parts: list[str] = []
@@ -849,7 +1222,7 @@ def assemble(cfg: Config, *, date_from: str | None = None, date_to: str | None =
         else:
             is_multi = bool(clean_df["vin"].duplicated().any())
             if is_multi:
-                prepared = prepare_multi_row_source(clean_df, source.name)
+                prepared = prepare_multi_row_source(clean_df, source.name, cfg)
                 n_duplicate = 0
             else:
                 n_duplicate = int(clean_df["vin"].duplicated().sum())
@@ -863,6 +1236,16 @@ def assemble(cfg: Config, *, date_from: str | None = None, date_to: str | None =
             "categories": categories, "n_vin_not_in_ledger": n_vin_not_in_ledger,
             "n_size_under": n_size_under, "n_size_over": n_size_over,
         })
+
+    if unmatched_parts:
+        unmatched_report = pd.concat(unmatched_parts, ignore_index=True)
+    else:
+        # 未一致0件でも、実際に使われた（解決済みの）source_key_columns でヘッダを組む
+        # （IC12: レポートのスキーマは実データと一致させる。key_columns をカスタマイズしていても崩れない）。
+        resolved_source_key_columns = tuple(repair_category_map_cfg["key_columns"].values())
+        unmatched_report_columns = ["source", "区分", *resolved_source_key_columns, "n_rows", "n_vin"]
+        unmatched_report = pd.DataFrame(columns=unmatched_report_columns)
+    _write_report(reports_dir, "repair_category_unmatched.csv", unmatched_report)
 
     for required in assemble_cfg["require_sources"]:
         if required not in frames or frames[required].empty:
@@ -909,6 +1292,12 @@ def assemble(cfg: Config, *, date_from: str | None = None, date_to: str | None =
     trend_wide = build_trend_wide(cfg, date_from, date_to, sources=sources)
     base, trend_report = join_trend(base, trend_wide, cfg, sources=sources)
 
+    # 剪定は trend 結合まで含めた最終パネルに対して1回だけ行う（X1・P4）。
+    prune_cfg = _prune_config(cfg)
+    base, prune_report = prune_low_cardinality_columns(base, cfg)
+    _write_report(reports_dir, prune_cfg["report_filename"], prune_report)
+    n_columns_pruned = int((prune_report["action"] == "dropped").sum()) if not prune_report.empty else 0
+
     base = _downcast_final_panel(base, cfg)
 
     panel_path.parent.mkdir(parents=True, exist_ok=True)
@@ -927,7 +1316,7 @@ def assemble(cfg: Config, *, date_from: str | None = None, date_to: str | None =
         trend_match_rate = 0.0
 
     result = {
-        "n_vin": len(base), "n_columns": int(base.shape[1]),
+        "n_vin": len(base), "n_columns": int(base.shape[1]), "n_columns_pruned": n_columns_pruned,
         "n_trend_columns": n_trend_columns, "trend_match_rate": trend_match_rate,
     }
     logger.info("assemble 完了: %s", result)

@@ -19,7 +19,11 @@ import pandas as pd
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src"))
 
-from defect_analysis.analysis_data import excluded_columns, resolve_predictors  # noqa: E402
+from defect_analysis.analysis_data import (  # noqa: E402
+    build_repair_group_columns,
+    excluded_columns,
+    resolve_predictors,
+)
 from defect_analysis.config import Config  # noqa: E402
 
 
@@ -87,6 +91,58 @@ class ResolvePredictorsLeakageTest(unittest.TestCase):
         self.assertNotIn("repair_修正__count", cfg.get("analysis.leakage_columns"))  # 明示リストには無い
         spec = resolve_predictors(_df(), cfg)
         self.assertNotIn("repair_修正__count", spec.all)
+
+    def test_composite_repair_category_column_is_excluded_without_explicit_listing(self):
+        # docs/repair_integrated_category_design.md IC11: repair_ 始まりの統合カテゴリ列は
+        # leakage_prefixes の "repair" に自動的に乗り、説明変数には1列も残らない。
+        cfg = _cfg()
+        df = _df().copy()
+        df["repair_修正__統合カテゴリ__上塗ブツ"] = [3, 0]
+
+        self.assertNotIn("repair_修正__統合カテゴリ__上塗ブツ", cfg.get("analysis.leakage_columns"))
+        spec = resolve_predictors(df, cfg)
+        self.assertNotIn("repair_修正__統合カテゴリ__上塗ブツ", spec.all)
+
+    def test_repair_group_columns_generated_by_build_repair_group_columns_are_excluded_from_predictors(self):
+        # docs/repair_group_comparison_design.md G3: build_repair_group_columns が実際に生成した
+        # 列（列名は直書きしない。呼び出し前後の差分から動的に検出する）が、接頭辞 "repair" により
+        # resolve_predictors の説明変数（数値・カテゴリ双方）から必ず除外されることを検証する。
+        # これにより REPAIR_GROUP_PREFIX 自体が別の接頭辞に変わる変異でも、生成列名がそれに追従して
+        # 検出されるため（本テストは常に実装の出力を追跡する）、リーク安全性の破壊を検出できる。
+        cfg = Config(
+            {
+                "analysis": {
+                    **_cfg().data["analysis"],
+                    "repair_groups": [
+                        {
+                            "name": "タレ",
+                            "groups": [
+                                {"label": "修正なし", "column": "has_repair_record", "eq": 0},
+                                {"label": "タレ", "column": "repair_修正__統合カテゴリ__タレ", "min": 1},
+                            ],
+                        }
+                    ],
+                }
+            },
+            root=Path("/tmp"),
+        )
+        df = _df().copy()
+        df["has_repair_record"] = [0, 1]
+        df["repair_修正__統合カテゴリ__タレ"] = [0, 1]
+
+        columns_before = set(df.columns)
+        df = build_repair_group_columns(df, cfg)
+        generated_columns = set(df.columns) - columns_before
+
+        # 生成列が0本だと以降のループが空振りで必ず緑になるため、まず1本以上あることを確認する。
+        self.assertGreaterEqual(len(generated_columns), 1)
+
+        spec = resolve_predictors(df, cfg)
+        for col in generated_columns:
+            with self.subTest(col=col):
+                self.assertNotIn(col, spec.all)
+                self.assertNotIn(col, spec.numeric)
+                self.assertNotIn(col, spec.categorical)
 
     def test_regex_only_leakage_column_is_excluded_via_leakage_regex(self):
         # "first_defect_date_note" は prefix "defect"/"has_defect" 等のいずれにも startswith しないが、

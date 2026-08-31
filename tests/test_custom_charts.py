@@ -22,7 +22,7 @@ sys.path.insert(0, str(_ROOT / "src"))
 
 from defect_analysis import eda  # noqa: E402
 from defect_analysis import viz_style as vs  # noqa: E402
-from defect_analysis.analysis_data import AnnotationMeta  # noqa: E402
+from defect_analysis.analysis_data import AnnotationMeta, build_repair_group_columns  # noqa: E402
 from defect_analysis.config import Config  # noqa: E402
 
 
@@ -217,6 +217,64 @@ class CustomChartsTest(unittest.TestCase):
         self.assertEqual(len(figures), 1)
         self.assertTrue((self.out_dir / "custom_02_histogram.png").exists())
         self.assertFalse((self.out_dir / "custom_01_scatter.png").exists())
+
+
+class RepairGroupBoxChartTest(unittest.TestCase):
+    """docs/repair_group_comparison_design.md §10-14: 群分け列を x にした box 図。
+
+    未割当（NaN）行が箱にならず、宣言した群のラベルだけが描画されることを検証する。
+    """
+
+    def setUp(self):
+        vs.apply_style()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.out_dir = Path(self._tmp.name) / "eda"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_box_with_group_column_draws_one_box_per_declared_group(self):
+        df = pd.DataFrame(
+            {
+                # 0-4: 修正なし。5-7: タレ。8-9: 修正はあるがタレではない（未割当 -> NaN）。
+                "has_repair_record": [0, 0, 0, 0, 0, 1, 1, 1, 1, 1],
+                "repair_修正__統合カテゴリ__タレ": [0, 0, 0, 0, 0, 1, 1, 1, 0, 0],
+                "y_value": [float(i) for i in range(10)],
+            }
+        )
+        cfg = Config(
+            {
+                "analysis": {
+                    "repair_groups": [
+                        {
+                            "name": "タレ",
+                            "groups": [
+                                {"label": "修正なし", "column": "has_repair_record", "eq": 0},
+                                {"label": "タレ", "column": "repair_修正__統合カテゴリ__タレ", "min": 1},
+                            ],
+                        }
+                    ]
+                }
+            },
+            root=self.out_dir,
+        )
+        columns_before = set(df.columns)
+        df = build_repair_group_columns(df, cfg)
+        generated = set(df.columns) - columns_before
+        # 生成列が0本だと以降の検証が空振りで必ず緑になるため、まず1本以上あることを確認する。
+        self.assertGreaterEqual(len(generated), 1)
+        # ラベル文字列を持つ群列を dtype から動的に見つける（列名は直書きしない。__bin は float）。
+        group_col = next(c for c in generated if df[c].dtype == object)
+        self.assertEqual(df[group_col].isna().sum(), 2)  # 未割当2行の存在を前提として確認
+
+        fig, _extra = eda._custom_box(
+            df, {"x": group_col, "y": "y_value", "title": "t"}, cfg, "tag",
+        )
+
+        ax = fig.axes[0]
+        labels = [t.get_text() for t in ax.get_xticklabels()]
+        self.assertEqual(set(labels), {"修正なし", "タレ"})
+        self.assertEqual(len(labels), 2)  # NaN 行は3本目の箱にならない
 
 
 if __name__ == "__main__":
