@@ -49,7 +49,7 @@ def _cfg(custom_charts: list | None, root: Path, **extra_analysis) -> Config:
 
 
 def _meta(n_rows: int) -> AnnotationMeta:
-    return AnnotationMeta(n_rows=n_rows, month_min=None, month_max=None, n_months=0, filters_summary="なし")
+    return AnnotationMeta(n_rows=n_rows, filters_summary="なし")
 
 
 class CustomChartsTest(unittest.TestCase):

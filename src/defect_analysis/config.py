@@ -33,7 +33,7 @@ class Config:
         return cls(data)
 
     def get(self, dotted_key: str, default: Any = None) -> Any:
-        """'features.severe_defect_level' のようなドット区切りで値を取得する。"""
+        """'analysis.eda_target' のようなドット区切りで値を取得する。"""
         node: Any = self._data
         for part in dotted_key.split("."):
             if not isinstance(node, dict) or part not in node:

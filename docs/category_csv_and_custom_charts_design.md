@@ -1,7 +1,7 @@
 # カテゴリ統合の CSV 化 ＆ config 宣言によるカスタム EDA グラフ 設計（2026-08-05）
 
 対象の 2 機能を 1 本にまとめた設計書。既存設計（`docs/real_data_ingest_design.md` /
-`docs/real_data_repair_design.md` / `docs/filter_and_annotation_design.md`）を置き換えるものではなく、
+`docs/real_data_repair_design.md`）を置き換えるものではなく、
 **差分だけ**を定義する。実データ経路（`convert` → `assemble` → `eda`/`stats`/`ml`）の枠組みは変えない。
 
 - 機能1: 統合カテゴリの変換ルールを YAML → **CSV の 1 対 1 マッピング表**に全面移行（後方互換なし）
@@ -32,7 +32,7 @@
 | V1 | **新セクションは `analysis.custom_charts`（リスト。既定 `[]`）**。`run_eda()` の最後に `_render_custom_charts()` を呼び、既存 7 系統の図の**後ろに追加**する | 既存図を一切変更しないという合意。`analysis` 配下に置けば `filters` など既存の分析設定と一箇所にまとまる。既定が空リストなら現行挙動と完全一致 |
 | V2 | **共通フィールドは `type` / `title` / `output` / `filters` / `hue`。型ごとの軸指定は「その型にとって自然な形」にする**（scatter/box/bar/histogram は `x`・`y`、heatmap は `columns` リスト） | x/y に無理に寄せると heatmap が破綻する。型ごとの必須フィールドを表で明示し、検証もそこに従う |
 | V3 | **フィルタは `analysis_data` の句 DSL をそのまま再利用する。そのために `_apply_clause` を使う公開関数 `apply_filter_clauses(df, rules, on_missing)` を新設し、`apply_filters` はその薄いラッパにする** | DSL の実装を二重に持たない。`apply_filters` は「0 行になったら `ValueError`」という全体停止の意味論を持つが、グラフ単位では「WARN してその図だけスキップ」にしたいので、0 行判定は `apply_filters` 側に残して分離する |
-| V4 | **グラフ単位フィルタは全体フィルタ（`analysis.filters`）の**上に**AND で追加適用する**（`run_eda` が読む df は既に全体フィルタ適用済み） | 全体フィルタは「分析対象母集団の定義」で全ステージに効く前提（`docs/filter_and_annotation_design.md`）。ここを個別図で無効化できると脚注の意味論が壊れる |
+| V4 | **グラフ単位フィルタは全体フィルタ（`analysis.filters`）の**上に**AND で追加適用する**（`run_eda` が読む df は既に全体フィルタ適用済み） | 全体フィルタは「分析対象母集団の定義」で全ステージに効く前提（仕様は README と `config/config.yaml` のコメントを参照）。ここを個別図で無効化できると脚注の意味論が壊れる |
 | V5 | **設定ミス（未知の `type`・必須欄欠落・列が存在しない・型不一致・フィルタ後 0 行）は WARNING を出してその図だけスキップし、処理は継続する** | 既存 eda の全図がこの方針（`_fig_*` は条件を満たさなければ WARN + `None` 返却）。EDA は探索用のレポート生成であり、1 枚の設定ミスで他の図を落とすのは損失が大きい |
 | V6 | **1 図の描画は個別に `try/except Exception` で囲み、失敗時は `logger.warning(..., exc_info=True)` でスキップして次の図へ進む** | V5 の事前検証で全ての失敗は拾いきれない（matplotlib 側の想定外など）。ただしスタックトレースを WARN に載せて「握り潰し」にはしない |
 | V7 | **hue の反映方法は型ごとに固定**（scatter=水準ごとの点群 / bar=横並びサブグループ / histogram=重ね書き（alpha=0.55）/ box=カテゴリ内の横並び / heatmap=**非対応、WARN して無視**） | heatmap は相関行列であり色軸が既に相関係数に使われている。エラーにせず無視 + WARN が V5 の方針と整合 |
@@ -177,15 +177,15 @@ source_column=args.source_column, output_column=args.output_column, map_path=arg
   #   scatter: x,y（数値）| bar: x（カテゴリ）,y（数値・省略で件数）,agg | histogram: x（数値）,bins,density
   #   box: y（数値）,x（カテゴリ・任意）| heatmap: columns（数値列リスト）,method
   #   設定ミス（列が無い・型違い・フィルタ後 0 行）はその図だけ WARN でスキップし処理は継続する。
-  #   例:
+  #   例（列名は実パネルに実在する列。2026-09-01 実測）:
   #     custom_charts:
-  #       - {type: scatter, x: EQ-01__pressure, y: EQ-01__stroke, hue: production_shift,
-  #          title: 圧入 圧力×ストローク, output: custom_pressure_stroke.png}
-  #       - {type: bar, x: 車種, y: has_repair_record, agg: mean,
-  #          filters: [{column: process_month, in: ["2026-07"]}]}
-  #       - {type: histogram, x: lead_time_sec, bins: 40, density: true, hue: has_repair_record}
-  #       - {type: box, x: production_shift, y: EQ-01__pressure}
-  #       - {type: heatmap, columns: [EQ-01__pressure, EQ-01__stroke, lead_time_sec], method: spearman}
+  #       - {type: scatter, x: 浮遊ゴミ__PA_ON_露点温度_測定値, y: 浮遊ゴミ__PA_ON_相対湿度_測定値, hue: has_repair_record,
+  #          title: 浮遊ゴミ PA_ON 露点温度×相対湿度, output: custom_scatter_measures.png}
+  #       - {type: bar, x: ブース__Line, y: has_repair_record, agg: mean,
+  #          filters: [{column: vin_pass_no, eq: 1}]}
+  #       - {type: histogram, x: 電着__本槽_極液_電導度_測定値, bins: 40, density: true, hue: has_repair_record}
+  #       - {type: box, x: ブース__Line, y: 電着__本槽_極液_電導度_測定値}
+  #       - {type: heatmap, columns: [電着__本槽_極液_電導度_測定値, 電着__整流器_1_積算電流値_測定値], method: spearman}
   custom_charts: []
   custom_chart_max_hue: 8          # hue 水準数の上限（超過分は頻度上位のみ描画し WARN）
   custom_chart_max_points: 20000   # scatter の最大描画点数（超過時は決定的サンプリング）

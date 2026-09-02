@@ -131,8 +131,8 @@ def clause_mask(df: pd.DataFrame, clause: dict, *, on_missing: str = "warn") -> 
     `_apply_clause` から抽出した公開関数（`analysis.filters` / `repair_groups` 共通の DSL 評価）。
     """
     if "query" in clause and "column" not in clause:
-        # 注意: EQ-01__pressure のようにハイフンを含む列名は query の識別子として
-        # 扱えないため、EQ 列はレンジ/集合系の句（min/max/in）で指定すること。
+        # 注意: 電着__本槽_極液_電導度_測定値 のように "__" や日本語を含む列名は query の識別子として
+        # 扱えないため、そのような列はレンジ/集合系の句（min/max/in）で指定すること。
         expr = clause["query"]
         try:
             idx = df.query(expr, engine="python").index
@@ -431,17 +431,11 @@ def build_repair_group_columns(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 @dataclass(frozen=True)
 class AnnotationMeta:
     n_rows: int  # フィルタ後の行数（＝図に使われた台数）
-    month_min: str | None  # process_month の最小（無ければ None）
-    month_max: str | None
-    n_months: int  # process_month のユニーク数（無ければ 0）
     filters_summary: str  # 設定された filters を人間可読化（無ければ "なし"）
 
     def footnote(self, *, data_kind: str, equipment: str | None = None) -> str:
         eq_label = equipment if equipment else "全設備"
-        if self.month_min is not None:
-            range_part = f"範囲: {self.month_min}〜{self.month_max}（{self.n_months}ヶ月・{self.n_rows:,}台）"
-        else:
-            range_part = f"範囲: 全期間（{self.n_rows:,}台）"
+        range_part = f"範囲: 全期間（{self.n_rows:,}台）"
         return f"設備: {eq_label} ｜ データ種: {data_kind}\n{range_part} ｜ フィルタ: {self.filters_summary}"
 
 
@@ -453,21 +447,15 @@ def build_annotation_meta(df: pd.DataFrame, cfg: Config) -> AnnotationMeta:
     脚注の件数とフィルタ表示が食い違う（呼び出しは load_real_panel→本関数の順で行う）。
     """
     n_rows = len(df)
-    months = sorted(df["process_month"].dropna().unique().tolist()) if "process_month" in df.columns else []
-    month_min = str(months[0]) if months else None
-    month_max = str(months[-1]) if months else None
-    n_months = len(months)
     rules = cfg.get("analysis.filters", []) or []
     summary_text = filters_summary(df, rules)
-    return AnnotationMeta(
-        n_rows=n_rows, month_min=month_min, month_max=month_max, n_months=n_months, filters_summary=summary_text
-    )
+    return AnnotationMeta(n_rows=n_rows, filters_summary=summary_text)
 
 
 def equipment_measure_groups(df: pd.DataFrame, *, include_pass_sec: bool = False) -> dict[str, list[str]]:
-    """トレンド列 '{EQ-xx}__{measure}' を設備プレフィクスでグルーピングして返す。
+    """トレンド列 '{設備}__{measure}'（例: 'ブース__Line'）を設備プレフィクスでグルーピングして返す。
 
-    キーは EQ-id、値はその設備の測定値列（既定で '__pass_sec' は除外）。決定的に列順ソート。
+    キーは設備プレフィクス、値はその設備の測定値列（既定で '__pass_sec' は除外）。決定的に列順ソート。
     """
     groups: dict[str, list[str]] = {}
     for col in df.columns:
@@ -478,12 +466,6 @@ def equipment_measure_groups(df: pd.DataFrame, *, include_pass_sec: bool = False
             continue
         groups.setdefault(eq, []).append(col)
     return {eq: sorted(cols) for eq, cols in sorted(groups.items())}
-
-
-def equipment_name_map(cfg: Config) -> dict[str, str]:
-    """synthesize.equipments の id->name を返す（無ければ空 dict）。表示名 'EQ-01 圧入' 用。"""
-    equipments = cfg.get("synthesize.equipments", []) or []
-    return {e["id"]: e["name"] for e in equipments if "id" in e and "name" in e}
 
 
 def excluded_columns(cfg: Config, columns: Iterable[str] | None = None) -> set[str]:

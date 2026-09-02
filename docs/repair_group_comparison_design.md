@@ -3,7 +3,7 @@
 `analysis.custom_charts` で「修正なしの車」と「特定の統合カテゴリの修正があった車」を
 同じ図の中で比較できるようにするための**群分け列**の設計。既存設計
 （`docs/category_csv_and_custom_charts_design.md` / `docs/repair_integrated_category_design.md` /
-`docs/panel_prune_and_multirow_agg_design.md` / `docs/filter_and_annotation_design.md`）を
+`docs/panel_prune_and_multirow_agg_design.md`）を
 置き換えるものではなく、**差分だけ**を定義する。
 
 解きたい問題: `repair_修正__top_統合カテゴリ` は修正が無い VIN で NaN になるため、
@@ -161,10 +161,10 @@ def resolve_predictors(df: pd.DataFrame, cfg: Config) -> FeatureSpec:
     ]
 ```
 
-- `config/config.yaml` の `leakage_prefixes` は
-  `[defect, repair, severe, severity, top_defect, max_severity, time_to_repair, has_defect, has_severe, has_repair]`。
-  接頭辞は `repair`（アンダースコア無し）なので `repair_group__*` と `repair_group__*__bin` は
-  **両方とも前方一致で除外される**。追加の config 変更は不要。
+- `config/config.yaml` の `leakage_prefixes` は `[defect, repair, has_repair]`
+  （2026-09-01 実測で 0 列だった `severe`/`severity`/`top_defect`/`max_severity`/`time_to_repair`/
+  `has_defect`/`has_severe` は削除済み）。接頭辞は `repair`（アンダースコア無し）なので
+  `repair_group__*` と `repair_group__*__bin` は**両方とも前方一致で除外される**。追加の config 変更は不要。
 - `traceability_measure_columns`（同ファイル 74 行）の `excluded_prefixes` にも `repair_` があるため、
   `repair_group__x`（`__` を含む）が設備 `repair_group` として `equipment_measure_groups` に
   混入することも無い。

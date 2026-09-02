@@ -43,35 +43,44 @@ analysis:
   # 行フィルタ: load_real_panel 読込直後に「リスト順」で AND 適用する（EDA/ML/stats 全系に効く）。
   #   省略 or 空リストなら全件（現行挙動と完全一致）。
   #   1要素 = 「column + 演算子」か「query 単独」。演算子: eq / in / not_in / min / max。
-  #   min と max は同一句で併用可（数値レンジ）。{設備}__{measure} のようにハイフンを含む列名は
+  #   min と max は同一句で併用可（数値レンジ）。{設備}__{measure} のように "__" や日本語を含む列名は
   #   query の識別子として扱えないため、そのような列はレンジ/集合系の句（min/max/in）で指定する。
-  #   設定例:
+  #   query に使えるのは vin_pass_no や has_repair_record のような単純な列名のみ。
+  #   設定例（列名は実パネルに実在する列。2026-09-01 実測）:
   #     filters:
-  #       - {column: process_month, in: ["2026-01", "2026-02"]}   # 年月の複数指定
-  #       - {column: plant_code,    eq: P01}                       # 存在時のみ有効（無ければ後述ポリシで処理）
-  #       - {column: operator,      not_in: [op_ito]}              # 特定作業者を除外
-  #       - {column: is_weekend,    eq: 0}                          # 平日のみ（is_weekend は 0/1）
-  #       - {column: production_shift, in: ["1直", "2直"]}          # シフト
-  #       - {column: lead_time_sec, min: 60, max: 3600}            # 数値レンジ（任意の数値列に対して）
-  #       - {query: "ng_rate < 0.5"}                                # 任意式（pandas.DataFrame.query）
+  #       - {column: ブース__Line, in: [1.0, 2.0]}                          # ラインで絞る（NaN=不明は除外される）
+  #       - {column: vin_pass_no,  eq: 1}                                    # 初回通過の車だけ（再通過を除く）
+  #       - {column: vin_format,   not_in: ["full17"]}                      # 特定の VIN 表記形式を除外
+  #       - {column: 電着__本槽_極液_電導度_測定値, min: 990, max: 1010}    # 数値レンジ（"__" を含む列は query 不可）
+  #       - {column: シーラー炉__入口_通過日時, min: "2026-01-10", max: "2026-01-20"}  # 期間で絞る（datetime 列）
+  #       - {query: "vin_pass_no == 1"}                                      # 任意式（pandas.DataFrame.query。単純名の列のみ）
   filters: []
 
   # 存在しない列を指定した句の扱い: warn=その句だけスキップして継続 / error=即エラー
-  #   plant_code・line_code のように「実データ次第で無い列」を warn で安全に無視する用途。
+  #   上塗ロボット__Line のように「実データ次第で無い列（設備が稼働していない期間など）」を
+  #   warn で安全に無視する用途。
   filters_on_missing_column: warn   # warn | error（既定 warn）
 
   # 説明変数から除外する結果由来列（不良・修正の帰結）。
   #   leakage_prefixes / leakage_regex の規約で拾える列は極力ここに書かない
   #   （新しい結果列が増えても規約側で自動的に拾える状態を保つため）。
-  leakage_columns: [first_defect_date, last_defect_date]
+  #   first_defect_date / last_defect_date は現行パネルには該当列が存在しないため削除
+  #   （旧・合成データ経路の列。2026-09-01 実測で0列。リーク防止の安全網としては leakage_prefixes /
+  #   leakage_regex の "defect" 系規約で今後の同種列も引き続き拾える）。
+  leakage_columns: []
   # 結果由来列を接頭辞ファミリで自動除外（手動リスト保守を減らす）。
-  #   EQ-xx__*, lead_time_*, wait_*, *_gap_sec, operator, production_*, is_weekend,
-  #   process_month, plant_code, line_code, lot_no はいずれの接頭辞にも該当しない。
-  leakage_prefixes: [defect, repair, severe, severity, top_defect, max_severity, time_to_repair, has_defect, has_severe, has_repair]
-  # 名前が prefix に乗らない結果列（例: first_defect_date / last_defect_date）向けの正規表現（任意）
-  leakage_regex: ["_defect_", "defect_date$"]
-  # 識別子・生時刻（説明変数にしない）
-  id_columns: [vin, vin_base, lot_no, first_in_ts, last_out_ts]
+  #   severe / severity / top_defect / max_severity / time_to_repair / has_defect / has_severe は
+  #   現行パネルには該当列が存在しないため削除（旧・合成データ経路の接頭辞。2026-09-01 実測で各0列）。
+  #   defect（2列）/ repair（97列）/ has_repair（1列）は現行パネルに実在するため維持する。
+  leakage_prefixes: [defect, repair, has_repair]
+  # 名前が prefix に乗らない結果列向けの正規表現（任意）。
+  #   _defect_ / defect_date$ は現行パネルには該当列が存在しないため削除
+  #   （旧・合成データ経路の列名パターン。2026-09-01 実測で0列）。
+  leakage_regex: []
+  # 識別子・生時刻（説明変数にしない）。
+  #   lot_no / first_in_ts / last_out_ts は現行パネルには該当列が存在しないため削除
+  #   （旧・合成データ経路の列。2026-09-01 実測で0列）。
+  id_columns: [vin, vin_base]
   cv_folds: 5
   test_size: 0.25
   random_state: 42
@@ -101,7 +110,25 @@ analysis:
   #       「該当カテゴリのカウント列（repair_修正__統合カテゴリ__*）が1件以上」を群の条件にするのが推奨）
   #     - base_column: 既存カテゴリ列（例: repair_修正__top_統合カテゴリ）をそのまま群として使う
   #   na_label を書くと、どの群にも該当しない行（groups）/ 欠損行（base_column）を第3群としてラベル化する。
-  #   既定は空リスト（列は1本も増えず現行挙動と完全一致）。以下2件は例。不要なら削除可。
+  #   既定は空リスト（列は1本も増えず現行挙動と完全一致）。以下2件（タレ/色ブツ、形式A・2群）は実際に有効。
+  #   不要なら削除可。他の形式（形式A・3群+na_label、形式B+na_label）はコピペ用の例としてコメントで示す
+  #   （列名は実パネルに実在する列。2026-09-01 実測。有効化するには repair_groups: に追記する）:
+  #     repair_groups:
+  #       # 形式A・3群（na_label）: 3つの句で名前付き群を定義し、どれにも該当しない行を na_label で
+  #       # 第4のラベル（ここでは「タレ/色ブツ/修正なし」以外＝他カテゴリの修正）にまとめる。
+  #       # repair_修正__top_統合カテゴリ（VIN あたり1値）への eq で群分けすると重複該当が起きない。
+  #       # groups が3要素のため __bin は生成されない（__bin は groups がちょうど2群のときだけ。G8）。
+  #       - name: 修正系統3群
+  #         groups:
+  #           - {label: タレ,     column: repair_修正__top_統合カテゴリ, eq: タレ}
+  #           - {label: 色ブツ,   column: repair_修正__top_統合カテゴリ, eq: "色ブツ (黒ブツ・白ブツ)"}
+  #           - {label: 修正なし, column: has_repair_record, eq: 0}
+  #         na_label: その他修正
+  #       # 形式B: 既存のカテゴリ列（repair_修正__top_統合カテゴリ、42種）をそのまま群として使い、
+  #       # NaN（＝修正なし車）を na_label でラベル化する（42カテゴリ+修正なしの多群比較）。
+  #       - name: 上位カテゴリ対比
+  #         base_column: repair_修正__top_統合カテゴリ
+  #         na_label: 修正なし
   repair_groups:
     - name: タレ
       groups:
@@ -118,16 +145,62 @@ analysis:
   #   scatter: x,y（数値）| bar: x（カテゴリ）,y（数値・省略で件数）,agg | histogram: x（数値）,bins,density
   #   box: y（数値）,x（カテゴリ・任意）| heatmap: columns（数値列リスト）,method
   #   設定ミス（列が無い・型違い・フィルタ後 0 行）はその図だけ WARN でスキップし処理は継続する。
-  #   例:
+  #   型ごとの例（列名は実パネルに実在する列。2026-09-01 実測。コピペ用。有効化するには
+  #   custom_charts: の下に追記する）:
   #     custom_charts:
-  #       - {type: scatter, x: EQ-01__pressure, y: EQ-01__stroke, hue: production_shift,
-  #          title: 圧入 圧力×ストローク, output: custom_pressure_stroke.png}
-  #       - {type: bar, x: 車種, y: has_repair_record, agg: mean,
-  #          filters: [{column: process_month, in: ["2026-07"]}]}
-  #       - {type: histogram, x: lead_time_sec, bins: 40, density: true, hue: has_repair_record}
-  #       - {type: box, x: production_shift, y: EQ-01__pressure}
-  #       - {type: heatmap, columns: [EQ-01__pressure, EQ-01__stroke, lead_time_sec], method: spearman}
-  #   以下4件は analysis.repair_groups の例（タレ/色ブツ）を使った対比グラフ。例。不要なら削除可
+  #       # --- box（箱ひげ） ---------------------------------------------------------------
+  #       - {type: box, x: ブース__Line, y: ブース__中塗_リサイクル空調_給気_乾球温度_測定値,
+  #          title: "ライン別 中塗リサイクル空調 給気乾球温度", output: custom_box_line_temp.png}
+  #          # 設備の測定値をライン（ブース__Line）で層別 → ライン間で工程条件がどれだけ違うか分かる
+  #       - {type: box, y: 電着__本槽_極液_電導度_測定値,
+  #          title: "電着 本槽極液電導度の分布（全体）", output: custom_box_single.png}
+  #          # x 省略で単体の箱ひげ → 全体のばらつき・外れ値の有無が分かる
+  #       # repair_group__* を x にした「修正なし vs 特定カテゴリ」比較は下記の4件（有効）を参照
+  #       # --- histogram（ヒストグラム） ------------------------------------------------------
+  #       - {type: histogram, x: 浮遊ゴミ__PA_ON_相対湿度_測定値, hue: has_repair_record,
+  #          density: true, bins: 30,
+  #          title: "浮遊ゴミ PA_ON 相対湿度の分布（リペア有無別）", output: custom_hist_hue.png}
+  #          # hue 併用。群でサンプル数が違うため density: true で正規化しないと母数の多い群の山が
+  #          # 見かけ上大きくなる → リペア有無で相対湿度分布に差があるか分かる
+  #       - {type: histogram, x: 前処理__湯洗_1_SS濃度_測定値, bins: 40,
+  #          filters: [{column: vin_pass_no, eq: 1}],
+  #          title: "前処理 湯洗1 SS濃度の分布（初回通過のみ）", output: custom_hist_bins.png}
+  #          # bins 指定で分布形状を細かく見る（filters に eq 指定の例も兼ねる）
+  #       # --- scatter（散布図） --------------------------------------------------------------
+  #       - {type: scatter, x: 浮遊ゴミ__PA_ON_露点温度_測定値, y: 浮遊ゴミ__PA_ON_相対湿度_測定値,
+  #          filters: [{query: "has_repair_record == 1"}],
+  #          title: "浮遊ゴミ PA_ON 露点温度と相対湿度の関係（リペアあり車のみ）",
+  #          output: custom_scatter_measures.png}
+  #          # 2測定値の関係（filters に query 指定の例も兼ねる。単純名の列のみ使える）
+  #       - {type: scatter, x: ブース__中塗_リサイクル空調_給気_乾球温度_測定値,
+  #          y: ブース__フラッシュオフ_HAB1_送気_絶対湿度_測定値, hue: has_repair_record,
+  #          title: "中塗給気温度とフラッシュオフ絶対湿度（リペア有無別）", output: custom_scatter_hue.png}
+  #          # hue 併用 → 2測定値の関係がリペア有無で変わるか分かる
+  #       - {type: scatter, x: 電着__本槽_極液_電導度_測定値, y: 電着__整流器_1_積算電流値_測定値,
+  #          alpha: 0.25, filters: [{column: 電着__本槽_極液_電導度_測定値, min: 990, max: 1010}],
+  #          title: "電着 本槽極液電導度と整流器1積算電流値（電導度990-1010に限定）",
+  #          output: custom_scatter_alpha.png}
+  #          # 点が多く重なるため alpha を下げて密度を見やすくする（filters に min+max レンジの例も兼ねる）
+  #       # --- bar（棒グラフ） ----------------------------------------------------------------
+  #       - {type: bar, x: vin_pass_no, title: "通過回数(vin_pass_no)別 件数", output: custom_bar_count.png}
+  #          # y 省略で件数 → 再通過（2回目以降）がどれくらいの頻度で起きているか分かる
+  #       - {type: bar, x: ブース__Line, y: has_repair_record, agg: mean,
+  #          title: "ライン別 リペア率（平均）", output: custom_bar_mean.png}
+  #          # y + agg: mean → ラインによってリペア率に差があるか分かる
+  #       # --- heatmap（相関ヒートマップ） -----------------------------------------------------
+  #       - type: heatmap
+  #         method: spearman
+  #         title: "設備横断 測定値相関（Spearman）"
+  #         output: custom_heatmap_spearman.png
+  #         columns:
+  #           - ブース__フラッシュオフ_HAB1_送気_絶対湿度_測定値
+  #           - ブース__中塗_リサイクル空調_給気_乾球温度_測定値
+  #           - 浮遊ゴミ__PA_ON_露点温度_測定値
+  #           - 浮遊ゴミ__PA_ON_相対湿度_測定値
+  #           - 電着__本槽_極液_電導度_測定値
+  #           - 電着__整流器_1_積算電流値_測定値
+  #          # columns に複数設備の測定値、method: spearman（外れ値に頑健）→ 設備間の相関構造が分かる
+  #   以下4件は analysis.repair_groups の例（タレ/色ブツ）を使った対比グラフ。実際に有効。不要なら削除可
   #   （docs/repair_group_comparison_design.md §6.1/§6.2）。
   custom_charts:
     - type: box

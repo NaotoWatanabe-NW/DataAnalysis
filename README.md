@@ -111,7 +111,7 @@ uv run python main.py ml       # ステップ6: 機械学習（ベースライ�
 
 - **eda**: カテゴリ別不良率・目的変数との相関・月次トレンド・不良種類別件数に加え、
   **測定値分布（箱ひげ）と相関ヒートマップは設備ごとに動的生成**する（トレンド列から設備を検出し、
-  設備数に追従。固定リストは持たない）。全図の下端に **設備名・データ種・データ範囲（年月/件数/適用フィルタ）
+  設備数に追従。固定リストは持たない）。全図の下端に **設備名・データ種・データ範囲（件数/適用フィルタ）
   の脚注**を焼き込む。配色は検証済みパレット、日本語対応。
 - **stats**: 数値×2群（Welch t / Mann-Whitney U）、カテゴリ×2群（カイ二乗）、数値×連続（Pearson/Spearman）、
   カテゴリ×連続（ANOVA/Kruskal-Wallis）。効果量と BH-FDR 補正後 p 値を `statistical_tests.csv` と
@@ -124,25 +124,26 @@ uv run python main.py ml       # ステップ6: 機械学習（ベースライ�
 
 `config.yaml` の `analysis.filters` にフィルタ句を並べると、`load_real_panel` の読込直後に
 **AND 適用**され、**EDA・統計・機械学習の全ステージに同時に効く**（未指定なら全件で従来どおり）。
-絞り込んだ条件はグラフ脚注の「データ範囲」にも自動反映される。設計は
-[docs/filter_and_annotation_design.md](docs/filter_and_annotation_design.md)。
+絞り込んだ条件はグラフ脚注の「データ範囲」にも自動反映される。
 
 ```yaml
 analysis:
   filters:
-    - {column: process_month, in: ["2026-01", "2026-02"]}  # 年月
-    - {column: plant_code,    eq: P01}                       # 工場・ライン
-    - {column: operator,      not_in: [op_ito]}              # 作業者を除外
-    - {column: is_weekend,    eq: 0}                          # 平日のみ（0/1）
-    - {column: lead_time_sec, min: 60, max: 3600}            # 数値レンジ（境界含む）
-    - {query: "ng_rate < 0.5"}                                # 任意式（pandas query）
+    - {column: ブース__Line, in: [1.0, 2.0]}                          # ラインで絞る（NaN=不明は除外される）
+    - {column: vin_pass_no,  eq: 1}                                    # 初回通過の車だけ（再通過を除く）
+    - {column: vin_format,   not_in: ["full17"]}                      # 特定の VIN 表記形式を除外
+    - {column: 電着__本槽_極液_電導度_測定値, min: 990, max: 1010}    # 数値レンジ（境界含む）
+    - {column: シーラー炉__入口_通過日時, min: "2026-01-10", max: "2026-01-20"}  # 期間で絞る（datetime 列）
+    - {query: "vin_pass_no == 1"}                                      # 任意式（pandas query。単純名の列のみ）
   filters_on_missing_column: warn   # warn=その句だけスキップ / error=即エラー
 ```
 
 - 演算子: `eq` / `in` / `not_in` / `min` / `max`（`min`+`max` で数値レンジ）/ `query`。
-- 存在しない列（実データ次第で無い列）は `filters_on_missing_column` に従い、既定 `warn` で
-  その句だけスキップ。全行が除外される設定は `ValueError` で明確に停止する。
-- `EQ-01__pressure` のようにハイフンを含む列は `query` の識別子にできないため `min`/`max`/`in` で指定する。
+- 存在しない列（実データ次第で無い列。例: 設備が稼働していない期間の `上塗ロボット__Line`）は
+  `filters_on_missing_column` に従い、既定 `warn` でその句だけスキップ。全行が除外される設定は
+  `ValueError` で明確に停止する。
+- `電着__本槽_極液_電導度_測定値` のように `__` や日本語を含む列は `query` の識別子にできないため
+  `min`/`max`/`in` で指定する（`query` は `vin_pass_no` や `has_repair_record` のような単純名の列のみ）。
 
 #### 追加グラフを config で指定する（`analysis.custom_charts`）
 
@@ -160,20 +161,75 @@ analysis:
 共通フィールド: `title` / `output`（`reports/eda/` 配下のファイル名） /
 `filters`（`analysis.filters` と同じ句を図単位で AND 追加適用） / `hue`（色分け列）。
 
+型ごとの例（列名は実パネルに実在する列。2026-09-01 実測。5型・全パターンを網羅）:
+
 ```yaml
 analysis:
   custom_charts:
-    - {type: scatter, x: EQ-01__pressure, y: EQ-01__stroke, hue: production_shift,
-       title: 圧入 圧力×ストローク, output: custom_pressure_stroke.png}
-    - {type: bar, x: 車種, y: has_repair_record, agg: mean,
-       filters: [{column: process_month, in: ["2026-07"]}]}
-    - {type: heatmap, columns: [EQ-01__pressure, EQ-01__stroke, lead_time_sec], method: spearman}
+    # --- box（箱ひげ） -----------------------------------------------------------
+    - {type: box, x: ブース__Line, y: ブース__中塗_リサイクル空調_給気_乾球温度_測定値,
+       title: "ライン別 中塗リサイクル空調 給気乾球温度", output: custom_box_line_temp.png}
+       # 設備の測定値をライン（ブース__Line）で層別 → ライン間で工程条件がどれだけ違うか
+    - {type: box, y: 電着__本槽_極液_電導度_測定値,
+       title: "電着 本槽極液電導度の分布（全体）", output: custom_box_single.png}
+       # x 省略で単体の箱ひげ → 全体のばらつき・外れ値の有無
+    # repair_group__* を x にした「修正なし vs 特定カテゴリ」比較は下記「修正なし車と対比する」参照
+
+    # --- histogram -----------------------------------------------------------------
+    - {type: histogram, x: 浮遊ゴミ__PA_ON_相対湿度_測定値, hue: has_repair_record,
+       density: true, bins: 30,
+       title: "浮遊ゴミ PA_ON 相対湿度の分布（リペア有無別）", output: custom_hist_hue.png}
+       # hue 併用。群でサンプル数が違うため density: true で正規化しないと母数の多い群の山が
+       # 見かけ上大きくなる → リペア有無で分布に差があるか
+    - {type: histogram, x: 前処理__湯洗_1_SS濃度_測定値, bins: 40,
+       filters: [{column: vin_pass_no, eq: 1}],
+       title: "前処理 湯洗1 SS濃度の分布（初回通過のみ）", output: custom_hist_bins.png}
+       # bins 指定で分布形状を細かく見る（filters に eq 指定の例も兼ねる）
+
+    # --- scatter -------------------------------------------------------------------
+    - {type: scatter, x: 浮遊ゴミ__PA_ON_露点温度_測定値, y: 浮遊ゴミ__PA_ON_相対湿度_測定値,
+       filters: [{query: "has_repair_record == 1"}],
+       title: "浮遊ゴミ PA_ON 露点温度と相対湿度の関係（リペアあり車のみ）",
+       output: custom_scatter_measures.png}
+       # 2測定値の関係（filters に query 指定の例も兼ねる。単純名の列のみ使える）
+    - {type: scatter, x: ブース__中塗_リサイクル空調_給気_乾球温度_測定値,
+       y: ブース__フラッシュオフ_HAB1_送気_絶対湿度_測定値, hue: has_repair_record,
+       title: "中塗給気温度とフラッシュオフ絶対湿度（リペア有無別）", output: custom_scatter_hue.png}
+       # hue 併用 → 2測定値の関係がリペア有無で変わるか
+    - {type: scatter, x: 電着__本槽_極液_電導度_測定値, y: 電着__整流器_1_積算電流値_測定値,
+       alpha: 0.25, filters: [{column: 電着__本槽_極液_電導度_測定値, min: 990, max: 1010}],
+       title: "電着 本槽極液電導度と整流器1積算電流値（電導度990-1010に限定）",
+       output: custom_scatter_alpha.png}
+       # 点が多く重なるため alpha を下げて密度を見やすくする（filters に min+max レンジの例も兼ねる）
+
+    # --- bar -----------------------------------------------------------------------
+    - {type: bar, x: vin_pass_no, title: "通過回数(vin_pass_no)別 件数", output: custom_bar_count.png}
+       # y 省略で件数 → 再通過（2回目以降）がどれくらいの頻度で起きているか
+    - {type: bar, x: ブース__Line, y: has_repair_record, agg: mean,
+       title: "ライン別 リペア率（平均）", output: custom_bar_mean.png}
+       # y + agg: mean → ラインによってリペア率に差があるか
+
+    # --- heatmap ---------------------------------------------------------------------
+    - type: heatmap
+      method: spearman
+      title: "設備横断 測定値相関（Spearman）"
+      output: custom_heatmap_spearman.png
+      columns:
+        - ブース__フラッシュオフ_HAB1_送気_絶対湿度_測定値
+        - ブース__中塗_リサイクル空調_給気_乾球温度_測定値
+        - 浮遊ゴミ__PA_ON_露点温度_測定値
+        - 浮遊ゴミ__PA_ON_相対湿度_測定値
+        - 電着__本槽_極液_電導度_測定値
+        - 電着__整流器_1_積算電流値_測定値
+       # columns に複数設備の測定値、method: spearman（外れ値に頑健）→ 設備間の相関構造
+
   custom_chart_max_hue: 8          # hue 水準数の上限（超過分は頻度上位のみ描画し WARN）
   custom_chart_max_points: 20000   # scatter の最大描画点数（超過時は決定的サンプリング）
 ```
 
 設定ミス（未知の `type`・列が存在しない・型不一致・フィルタ後0行）は**その図だけ** WARNING を出して
-スキップし、他の図の生成は継続する（処理全体は止まらない）。
+スキップし、他の図の生成は継続する（処理全体は止まらない）。上記の例はすべて `main.py eda` で実際に
+描画できることを確認済み（2026-09-01。一時的に全件有効化して実行し、WARNING・スキップが0件だったことを確認）。
 
 #### 修正なし車と対比する（`analysis.repair_groups`）
 
@@ -202,6 +258,38 @@ analysis:
         - {column: repair_group__タレ, in: [修正なし, タレ]}
       title: 修正なし vs タレ修正 ｜ ブース フラッシュオフHAB1 送気 絶対湿度
       output: repair_group_タレ_絶対湿度.png
+```
+
+`groups`/`base_column` それぞれのバリエーション（3群+`na_label`、既存カテゴリ列の流用）の例:
+
+```yaml
+analysis:
+  repair_groups:
+    # 形式A・3群（na_label）: 3つの句で名前付き群を定義し、どれにも該当しない行を na_label で
+    # 第4のラベル（ここでは「タレ/色ブツ/修正なし」以外＝他カテゴリの修正）にまとめる。
+    # repair_修正__top_統合カテゴリ（VIN あたり1値）への eq で群分けすると重複該当が起きない。
+    # groups が3要素のため __bin は生成されない（__bin は groups がちょうど2群のときだけ）。
+    - name: 修正系統3群
+      groups:
+        - {label: タレ,     column: repair_修正__top_統合カテゴリ, eq: タレ}
+        - {label: 色ブツ,   column: repair_修正__top_統合カテゴリ, eq: "色ブツ (黒ブツ・白ブツ)"}
+        - {label: 修正なし, column: has_repair_record, eq: 0}
+      na_label: その他修正
+
+    # 形式B: 既存のカテゴリ列（repair_修正__top_統合カテゴリ、42種）をそのまま群として使い、
+    # NaN（＝修正なし車）を na_label でラベル化する（42カテゴリ+修正なしの多群比較）。
+    - name: 上位カテゴリ対比
+      base_column: repair_修正__top_統合カテゴリ
+      na_label: 修正なし
+
+  custom_charts:
+    - type: box
+      x: repair_group__上位カテゴリ対比
+      y: ブース__フラッシュオフ_HAB1_送気_絶対湿度_測定値
+      filters:
+        - {column: repair_group__上位カテゴリ対比, in: [修正なし, タレ, "色ブツ (黒ブツ・白ブツ)"]}
+      title: 上位統合カテゴリ(base_column) 別 ブース フラッシュオフHAB1 絶対湿度
+      output: repair_group_base_column_絶対湿度.png
 ```
 
 - `name` はサフィックスのみで、接頭辞 `repair_group__` は**常にコードが付ける**。
