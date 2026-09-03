@@ -679,9 +679,11 @@ def _zero_fill_after_merge(
     """
     p = f"{prefix}_{name}"
     new_cols = [c for c in base.columns if c not in before_cols]
-    for c in new_cols:
-        if c in (f"{p}__has", f"{p}__count") or any(infix in c for infix in count_infixes):
-            base[c] = base[c].fillna(0)
+    zero_fill_cols = [
+        c for c in new_cols if c in (f"{p}__has", f"{p}__count") or any(infix in c for infix in count_infixes)
+    ]
+    if zero_fill_cols:
+        base[zero_fill_cols] = base[zero_fill_cols].fillna(0)
 
 
 def _add_has_repair_record(base: pd.DataFrame) -> pd.DataFrame:
@@ -1107,8 +1109,8 @@ def _downcast_final_panel(base: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         c for c in base.select_dtypes(include="float64").columns
         if not should_keep_float64(c, keep_suffixes)
     ]
-    for c in target_cols:
-        base[c] = base[c].astype("float32")
+    if target_cols:
+        base[target_cols] = base[target_cols].astype("float32")
     return base
 
 
@@ -1284,6 +1286,10 @@ def assemble(cfg: Config, *, date_from: str | None = None, date_to: str | None =
         # 0 埋めしない（ユーザー判断 2026-07-31。docs/real_data_ingest_design.md §13-7 参照）。
         # NaN のまま残すことで「不良ゼロ」と「未検査」を区別できるようにする。
         # traceability は present__{name} で存在有無を既に表現しているため対象外（従来から no-op）。
+
+    # frames.items() 分の逐次 merge でブロックが断片化するため、以降の列単位操作の前に
+    # 一括で defragment する（pandas 推奨の `newframe = frame.copy()` パターン）。
+    base = base.copy()
 
     base = _add_has_repair_record(base)
 

@@ -3,7 +3,7 @@ name = "dataanalysis"
 version = "0.1.0"
 description = "VINを主キーに設備トレーサビリティ/トレンド/不良/修正を統合し不良原因を追求する分析パイプライン"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = [
     "lightgbm>=4.7.0",
     "matplotlib>=3.11.1",
@@ -21,6 +21,11 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: 実データを使う低速テスト（デフォルトでは除外しない）",
 ]
 
 # numba は numpy<2.5 を要求するため、numpy を 2.4 系に固定しないと
